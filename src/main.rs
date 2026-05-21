@@ -50,7 +50,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::UnixDatagram;
 use tracing::{debug, error, info, trace, warn};
 
-pub mod protos {
+mod protos {
     include!(concat!(env!("OUT_DIR"), "/sni_router.rs"));
 }
 
@@ -62,7 +62,7 @@ const BUF_CAPACITY: usize = 2048;
 /// # Errors
 ///
 /// Probably file not readable or parsable.
-pub fn load_certs<P: AsRef<std::path::Path>>(filename: P) -> Result<Vec<CertificateDer<'static>>> {
+fn load_certs<P: AsRef<std::path::Path>>(filename: P) -> Result<Vec<CertificateDer<'static>>> {
     let filename = filename.as_ref();
     let pem = CertificateDer::pem_file_iter(filename)
         .context(format!("Loading certs from {}", filename.display()))?;
@@ -75,7 +75,7 @@ pub fn load_certs<P: AsRef<std::path::Path>>(filename: P) -> Result<Vec<Certific
 /// # Errors
 ///
 /// Probably file not readable or parsable.
-pub fn load_private_key<P: AsRef<std::path::Path>>(filename: P) -> Result<PrivateKeyDer<'static>> {
+fn load_private_key<P: AsRef<std::path::Path>>(filename: P) -> Result<PrivateKeyDer<'static>> {
     let filename = filename.as_ref();
     PrivateKeyDer::from_pem_file(filename)
         .context(format!("Loading private key from {}", filename.display()))
@@ -86,7 +86,7 @@ pub fn load_private_key<P: AsRef<std::path::Path>>(filename: P) -> Result<Privat
 /// # Errors
 ///
 /// System setsockopt errors.
-pub fn set_nodelay(fd: libc::c_int) -> anyhow::Result<()> {
+fn set_nodelay(fd: libc::c_int) -> anyhow::Result<()> {
     let flag: libc::c_int = 1; // Enable TCP_NODELAY (disable Nagle)
     let ret = unsafe {
         libc::setsockopt(
