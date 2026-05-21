@@ -1085,7 +1085,11 @@ async fn main() -> Result<()> {
         .with_env_filter(&opt.verbose)
         .with_writer(std::io::stderr)
         .init();
-    info!("SNI Router");
+    info!(
+        "SNI Router {} built with {}",
+        env!("GIT_VERSION"),
+        env!("RUSTC_VERSION")
+    );
     let listener = tokio::net::TcpListener::bind(&opt.listen)
         .await
         .context(format!("listening to {}", opt.listen))?;
