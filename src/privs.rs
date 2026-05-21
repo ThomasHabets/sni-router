@@ -10,7 +10,7 @@ use tracing::{info, trace, warn};
 ///
 // Not actually dead code, just not used in tarweb, only SNI.
 #[allow(dead_code)]
-pub fn sni_drop(dirs: &[&std::path::Path]) -> Result<()> {
+pub(crate) fn sni_drop(dirs: &[&std::path::Path], write_keylogfile: bool) -> Result<()> {
     use landlock::{
         ABI, Access, AccessFs, AccessNet, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus,
         Scope, path_beneath_rules,
@@ -21,13 +21,28 @@ pub fn sni_drop(dirs: &[&std::path::Path]) -> Result<()> {
     let abi = ABI::V6;
 
     // Kernel 5.13 or better. tarweb already requires 6.7.
-    let status = Ruleset::default()
-        .handle_access(AccessFs::from_all(abi))?
-        .handle_access(AccessNet::BindTcp)?
-        .create()?
-        .set_no_new_privs(true)
-        .add_rules(path_beneath_rules(dirs, AccessFs::from_read(abi)))?
-        .restrict_self()?;
+    let status = {
+        let mut ruleset = Ruleset::default()
+            .handle_access(AccessFs::from_all(abi))?
+            .handle_access(AccessNet::BindTcp)?
+            .create()?
+            .set_no_new_privs(true)
+            .add_rules(path_beneath_rules(dirs, AccessFs::from_read(abi)))?;
+        if let Ok(k) = std::env::var("SSLKEYLOGFILE")
+            && write_keylogfile
+        {
+            let keylogfile = std::path::PathBuf::from(k);
+            // Create it if it doesn't exist.
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&keylogfile);
+            ruleset =
+                ruleset.add_rules(path_beneath_rules(&[keylogfile], AccessFs::from_write(abi)))?;
+        }
+        ruleset
+    }
+    .restrict_self()?;
     match status.ruleset {
         RulesetStatus::FullyEnforced => {
             info!("Landlock enabled and fully enforced for filesystem and network");

@@ -1095,6 +1095,7 @@ async fn main() -> Result<()> {
             .iter()
             .map(std::path::PathBuf::as_path)
             .collect::<Vec<_>>(),
+        opt.allow_keylogging,
     )?;
     set_nodelay(listener.as_raw_fd())?;
     // Config.
