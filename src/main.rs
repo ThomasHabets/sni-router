@@ -394,7 +394,7 @@ async fn pass_fd_over_uds(
     let cmsg = [ControlMessage::ScmRights(&[fd])];
 
     // Async wait until it *should* be fine to write.
-    sock.writable().await?;
+    sock.writable().await.context("checking UDS for writable")?;
 
     // Send sync, but per above *should* be fine to write. Also with
     // `MSG_DONTWAIT` it shouldn't block.
@@ -705,7 +705,10 @@ async fn tls_handshake(
 
         // Handshake still going.
         let mut buf = [0u8; 4096];
-        let n = stream.read(&mut buf).await?;
+        let n = stream
+            .read(&mut buf)
+            .await
+            .context("reading during handshake")?;
         if n == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -727,7 +730,9 @@ async fn tls_handshake(
 /// This is called under handshake timeout, and failure will fall back to sorry
 /// server.
 async fn connect_for_proxy(id: usize, addr: &str) -> Result<tokio::net::TcpStream> {
-    let addrs = addr.to_socket_addrs()?;
+    let addrs = addr
+        .to_socket_addrs()
+        .context(format!("parsing backend address {addr}"))?;
     let mut conn = None;
     for addr in addrs {
         match tokio::net::TcpStream::connect(addr).await {
@@ -787,8 +792,8 @@ async fn handle_connected_proxy(
     let (mut down_r, mut down_w) = stream.split();
     let upstream = async {
         if proxy_header {
-            let me = down_r.local_addr()?;
-            let peer = down_r.peer_addr()?;
+            let me = down_r.local_addr().context("getting local address")?;
+            let peer = down_r.peer_addr().context("getting peer address")?;
             let src_port = peer.port();
             let src_addr = peer.ip().to_string();
             let proto = if peer.is_ipv4() {
@@ -803,18 +808,30 @@ async fn handle_connected_proxy(
             up_w.write_all(
                 format!("PROXY {proto} {src_addr} {dst_addr} {src_port} {dst_port}\r\n").as_bytes(),
             )
-            .await?;
+            .await
+            .context("writing proxy line")?;
         }
         // Re-write ClientHello or anything else pre-read.
-        up_w.write_all(&bytes).await?;
-        tokio::io::copy(&mut down_r, &mut up_w).await?;
-        up_w.shutdown().await?;
+        up_w.write_all(&bytes)
+            .await
+            .context("writing preamble to proxied backend")?;
+        tokio::io::copy(&mut down_r, &mut up_w)
+            .await
+            .context("upstream copying")?;
+        up_w.shutdown()
+            .await
+            .context("failed to shut down upstream writer")?;
         trace!("id={id} Upstream write completed");
         Ok::<_, anyhow::Error>(())
     };
     let downstream = async {
-        tokio::io::copy(&mut up_r, &mut down_w).await?;
-        down_w.shutdown().await?;
+        tokio::io::copy(&mut up_r, &mut down_w)
+            .await
+            .context("downstream copying")?;
+        down_w
+            .shutdown()
+            .await
+            .context("failed to shut down downstream writer")?;
         trace!("id={id} Downstream write completed");
         Ok::<_, anyhow::Error>(())
     };
@@ -1034,7 +1051,7 @@ async fn mainloop(
         .expect("Registering SIGHUP");
     loop {
         let (stream, peer) = tokio::select! {
-            r = listener.accept() => r,
+            r = listener.accept() => r.context("accepting connection"),
             _ = hups.recv() => {
                 let cwd = std::env::current_dir().map(|c|c.display().to_string()).unwrap_or("<unknown>".to_string());
                 info!("Got SIGHUP. Loading new config {config_filename:?} in cwd {cwd:?}");
