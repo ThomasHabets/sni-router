@@ -36,7 +36,9 @@ use std::net::ToSocketAddrs;
 use std::os::unix::io::AsRawFd;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::LazyLock;
 
+use prometheus::Histogram;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
@@ -56,6 +58,62 @@ mod protos {
 
 // How much capacity to prepare for ClientHello and stuff.
 const BUF_CAPACITY: usize = 2048;
+const UNKNOWN_SNI: &str = "<unknown>";
+const MISSING_SNI: &str = "<missing>";
+
+static REGISTRY: LazyLock<prometheus::Registry> = LazyLock::new(prometheus::Registry::new);
+
+static ACCEPTS: LazyLock<prometheus::IntCounter> = LazyLock::new(|| {
+    let metric = prometheus::IntCounter::new("tcp_accept", "Total TCP connects").unwrap();
+    REGISTRY.register(Box::new(metric.clone())).unwrap();
+    metric
+});
+
+static SNI: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
+    let metric = prometheus::IntCounterVec::new(
+        prometheus::Opts::new("sni", "Clienthellos with SNI"),
+        &["sni"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(metric.clone())).unwrap();
+    metric
+});
+
+static HANDSHAKE_LATENCY: LazyLock<prometheus::Histogram> = LazyLock::new(|| {
+    use prometheus::HistogramOpts;
+    let metric = Histogram::with_opts(
+        HistogramOpts::new("handshake_latency_ms", "Handshake latency")
+            .buckets(prometheus::exponential_buckets(1.0, 2.0f64.sqrt(), 40).unwrap()),
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(metric.clone())).unwrap();
+    metric
+});
+
+static HOSTNAME: LazyLock<String> = LazyLock::new(|| {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .map(|s| s.trim_end().to_owned())
+                .unwrap_or_else(|_| "unknown".to_owned())
+        })
+});
+
+fn push_metrics() -> Result<()> {
+    info!("Pushing metrics");
+    let grouping = std::collections::HashMap::from([("instance".to_string(), (*HOSTNAME).clone())]);
+
+    prometheus::push_metrics(
+        "sni-router",            // job name
+        grouping,                // grouping labels
+        "http://localhost:9091", // Pushgateway URL
+        REGISTRY.gather(),
+        None, // optional basic auth
+    )?;
+    Ok(())
+}
 
 /// Load certificate chain from file.
 ///
@@ -619,6 +677,7 @@ async fn tls_handshake(
     use tokio::io::AsyncWriteExt;
 
     debug!("Handshaking…");
+    let handshake_start = std::time::Instant::now();
 
     // If this fails, we could actually still continue with a sorry server in
     // the caller, but it seems like a very unlikely case, so let's just fail.
@@ -652,6 +711,7 @@ async fn tls_handshake(
         }
         let still_handshaking = tls.is_handshaking();
         if !still_handshaking {
+            HANDSHAKE_LATENCY.observe(handshake_start.elapsed().as_millis() as f64);
             let plain_n = io.plaintext_bytes_to_read();
             let mut buf = vec![0u8; plain_n];
             let n = tls
@@ -784,6 +844,7 @@ async fn handle_connected_proxy(
     tls: Option<Arc<rustls::ServerConfig>>,
 ) -> Result<()> {
     let (mut stream, bytes) = if let Some(tls) = tls {
+        // TODO: increment handshake fail counter.
         tls_handshake(stream, bytes, tls).await?
     } else {
         (stream, bytes)
@@ -896,6 +957,7 @@ fn connect_or_handoff_backend<'a>(
                     );
                 }
                 let (stream, bytes) = if let Some(tls) = frontend_tls {
+                    // TODO: increment handshake fail counter.
                     tls_handshake(stream, bytes, tls.clone()).await?
                 } else {
                     (stream, bytes)
@@ -982,6 +1044,7 @@ async fn route_and_connect(
                     for rule in &config.rules {
                         if is_full_match(&rule.re, &sni) {
                             trace!("id={id} SNI {sni} matched rule {rule:?}");
+                            SNI.with_label_values(&[&sni]).inc();
                             return Ok(RoutedConnection {
                                 backend: connect_or_handoff_backend_with_timeout(
                                     id,
@@ -995,8 +1058,10 @@ async fn route_and_connect(
                             });
                         }
                     }
+                    SNI.with_label_values(&[UNKNOWN_SNI]).inc();
                 }
                 None => {
+                    SNI.with_label_values(&[MISSING_SNI]).inc();
                     warn!("id={id} Failed to extract SNI");
                 }
             }
@@ -1051,7 +1116,13 @@ async fn mainloop(
         .expect("Registering SIGHUP");
     loop {
         let (stream, peer) = tokio::select! {
-            r = listener.accept() => r.context("accepting connection"),
+            r = listener.accept() => match r {
+                Ok(r) => r,
+                Err(e) => {
+                    error!("accept() failed: {e}");
+                    continue;
+                }
+            },
             _ = hups.recv() => {
                 let cwd = std::env::current_dir().map(|c|c.display().to_string()).unwrap_or("<unknown>".to_string());
                 info!("Got SIGHUP. Loading new config {config_filename:?} in cwd {cwd:?}");
@@ -1063,7 +1134,8 @@ async fn mainloop(
                 }
                 continue;
             }
-        }?;
+        };
+        ACCEPTS.inc();
         debug!("id={id} fd={} Accepted {}", stream.as_raw_fd(), peer);
         let config = config.clone();
         tokio::spawn(async move {
@@ -1122,6 +1194,18 @@ async fn main() -> Result<()> {
     // Config.
     let config = load_config(&opt.config, opt.allow_keylogging)
         .context(format!("Loading config {:?}", opt.config))?;
+    std::thread::Builder::new()
+        .name("prometheus-pusher".to_string())
+        .spawn(move || {
+            loop {
+                if let Err(err) = push_metrics() {
+                    eprintln!("failed to push prometheus metrics: {err}");
+                }
+
+                std::thread::sleep(std::time::Duration::from_mins(1));
+            }
+        })
+        .expect("spawn prometheus pusher thread");
     mainloop(
         Arc::new(config),
         &opt.config,
