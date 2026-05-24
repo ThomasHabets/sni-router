@@ -33,7 +33,7 @@
 #![allow(clippy::similar_names)]
 
 use std::net::ToSocketAddrs;
-use std::os::unix::io::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -42,13 +42,14 @@ use prometheus::Histogram;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
+mod fd_io;
 mod privs;
 
 use anyhow::anyhow;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
+use tokio::io::unix::AsyncFd;
 use tokio::net::UnixDatagram;
 use tracing::{debug, error, info, trace, warn};
 
@@ -345,7 +346,7 @@ fn load_config(filename: &str, allow_keylogging: bool) -> Result<Config> {
     Ok(config)
 }
 
-/// Read enough bytes from `stream` to cover the entire TLS `ClientHello` handshake
+/// Peek enough bytes from `stream` to cover the entire TLS `ClientHello` handshake
 /// (which may span multiple records). Returns the handshake (type+len+body).
 ///
 /// TLS record format:
@@ -356,73 +357,65 @@ fn load_config(filename: &str, allow_keylogging: bool) -> Result<Config> {
 ///   - `msg_type(1)=1(ClientHello)`
 ///   - length(3) = `body_len`
 ///
-/// Return all bytes read, and clienthello bytes.
-///
 /// This function is mostly AI coded for the parsing parts. Seems to work, and
 /// reviewing it it seems safe.
-async fn read_tls_clienthello(
-    stream: &mut tokio::net::TcpStream,
-) -> Result<(Vec<u8>, Result<Vec<u8>>)> {
+async fn read_tls_clienthello(stream: &AsyncFd<OwnedFd>) -> Result<Vec<u8>> {
     const REC_HDR_LEN: usize = 5;
+    let mut buf = Vec::with_capacity(BUF_CAPACITY);
+    let mut covered: usize = 0;
     let mut hello = Vec::with_capacity(BUF_CAPACITY);
-    let mut bytes = Vec::with_capacity(BUF_CAPACITY);
 
     // We need at least first record to see handshake header (type + 3-byte len).
     // Loop records until we have full ClientHello bytes (4 + body_len).
     let mut needed: Option<usize> = None;
 
     while needed.is_none_or(|n| hello.len() < n) {
-        // Read record header.
-        let mut rec_hdr = [0u8; REC_HDR_LEN];
-        stream
-            .read_exact(&mut rec_hdr)
+        let header_end = covered + REC_HDR_LEN;
+        if buf.len() < header_end {
+            buf.resize(header_end, 0);
+        }
+        fd_io::peek_exact(stream, &mut buf[..header_end])
             .await
-            .context("read TLS record header")?;
-        bytes.extend(rec_hdr);
-
-        // Parse header.
-        let content_type = rec_hdr[0];
-        let _legacy_ver = u16::from_be_bytes([rec_hdr[1], rec_hdr[2]]);
-        let rec_len = u16::from_be_bytes([rec_hdr[3], rec_hdr[4]]) as usize;
+            .context("peek TLS record header")?;
+        let hdr = &buf[covered..header_end];
+        let content_type = hdr[0];
+        let rec_len = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
 
         // Confirm it's Handshake.
         if content_type != 22 {
-            return Ok((
-                bytes,
-                Err(anyhow!(
-                    "unexpected TLS content_type {content_type}, want 22 (handshake)"
-                )),
-            ));
+            bail!("unexpected TLS content_type {content_type}, want 22 (handshake)");
         }
         if rec_len == 0 {
-            return Ok((bytes, Err(anyhow!("zero-length TLS record"))));
+            bail!("zero-length TLS record");
         }
 
-        // Read whole record.
-        let mut rec_payload = vec![0u8; rec_len];
-        stream
-            .read_exact(&mut rec_payload)
+        // Peek whole record.
+        let rec_end = header_end + rec_len;
+        if buf.len() < rec_end {
+            buf.resize(rec_end, 0);
+        }
+
+        // Read whole ClientHello
+        //
+        // TODO: I wonder if this can be optimized by making kernel skip the parts we have already peeked the previous read.
+        // TODO: What if TCP buffer is full of TCP headers and this function won't be able to progress as kernel will no
+        // longer receive more until we actually consume some bytes?
+        fd_io::peek_exact(stream, &mut buf[..rec_end])
             .await
-            .context("read TLS record payload")?;
+            .context("peek TLS record payload")?;
 
         // Append to handshake buffer (could contain partial or full ClientHello).
-        hello.extend(&rec_payload);
-        bytes.extend(&rec_payload);
+        hello.extend_from_slice(&buf[header_end..rec_end]);
+
+        covered = rec_end;
 
         // If we haven't established how many bytes we need, try now.
-        if needed.is_none() {
-            if hello.len() < 4 {
-                // Not enough to read handshake header yet; continue.
-                continue;
-            }
-            let msg_type = hello[0];
-            if msg_type != 1 {
-                return Ok((
-                    bytes,
-                    Err(anyhow!(
-                        "first handshake msg is type {msg_type}, expected 1 (ClientHello)"
-                    )),
-                ));
+        if needed.is_none() && hello.len() >= 4 {
+            if hello[0] != 1 {
+                bail!(
+                    "first handshake msg is type {}, expected 1 (ClientHello)",
+                    hello[0]
+                );
             }
             let body_len =
                 ((hello[1] as usize) << 16) | ((hello[2] as usize) << 8) | (hello[3] as usize);
@@ -432,11 +425,8 @@ async fn read_tls_clienthello(
 
     // Truncate to exactly the ClientHello (in case next record started).
     // TODO: that's impossible, right?
-    let n = needed.unwrap();
-    if hello.len() > n {
-        hello.truncate(n);
-    }
-    Ok((bytes, Ok(hello)))
+    hello.truncate(needed.unwrap());
+    Ok(hello)
 }
 
 /// Send file descriptor and handshake data using `SCM_RIGHTS` on a Unix datagram.
