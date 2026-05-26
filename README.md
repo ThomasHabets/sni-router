@@ -9,7 +9,7 @@ The connection to the backend can be proxied, with or without PROXY protocol,
 and optionally with "frontend TLS".
 
 The connection can also be handed off to the backend over a UNIX domain socket.
-The benefit of that is that once the TLS handshake is over, we sni-router is no
+The benefit of that is that once the TLS handshake is over, sni-router is no
 longer in the connection path, and can be restarted without interrupting
 existing connections.
 
