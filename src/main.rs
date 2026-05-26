@@ -217,6 +217,33 @@ fn load_tls(
     })))
 }
 
+/// Load ACL from the parsed proto.
+fn load_acl(pb: &protos::Acl) -> Result<Acl> {
+    let mut rules = Vec::new();
+    for rule in &pb.rules {
+        let source: ipnet::IpNet = rule
+            .source
+            .parse()
+            .context(format!("parsing cidr {}", rule.source))?;
+        let source = match source {
+            ipnet::IpNet::V4(v4net) => {
+                let net = v4net.network().to_ipv6_mapped();
+                let prefix = 96 + v4net.prefix_len();
+                ipnet::Ipv6Net::new(net, prefix)?
+            }
+            ipnet::IpNet::V6(v6) => v6,
+        };
+        rules.push(AclRule {
+            source,
+            action: rule.action().clone(),
+        });
+    }
+    Ok(Acl {
+        rules,
+        default_action: pb.default_action(),
+    })
+}
+
 /// Load backend config from the parsed proto.
 ///
 /// This includes loading the TLS cert/key, so it's not just proto data
@@ -318,7 +345,13 @@ fn load_config(filename: &str, allow_keylogging: bool) -> Result<Config> {
     for rule in protocfg.rules {
         config.rules.push(Rule {
             re: regex::Regex::new(&rule.regex)?,
-            acl: rule.acl,
+            acl: rule.acl.map_or(
+                Ok(Acl {
+                    rules: vec![],
+                    default_action: protos::AclAction::Accept,
+                }),
+                |a| load_acl(&a),
+            )?,
             timeout: rule.backend.as_ref().and_then(|b| {
                 let t = b.max_lifetime_ms;
                 if t > 0 {
@@ -619,14 +652,23 @@ enum Backend {
     },
 }
 
+#[derive(Debug, Clone)]
+struct Acl {
+    rules: Vec<AclRule>,
+    default_action: protos::AclAction,
+}
+
+#[derive(Debug, Clone)]
+struct AclRule {
+    source: ipnet::Ipv6Net,
+    action: protos::AclAction,
+}
+
 #[derive(Debug)]
 struct Rule {
     re: regex::Regex,
     backend: Backend,
-
-    // TODO: this should be a native struct, not a proto, since we want to
-    // validate it.
-    acl: Option<protos::Acl>,
+    acl: Acl,
     timeout: Option<tokio::time::Duration>,
 }
 
@@ -1028,26 +1070,13 @@ fn is_full_match(re: &regex::Regex, text: &str) -> bool {
     }
 }
 
-// TODO: this should not be fallible, after load time verification is done.
-fn acl_action(acl: &protos::Acl, peer: &std::net::IpAddr) -> Result<protos::AclAction> {
+fn acl_action(acl: &Acl, peer: &std::net::Ipv6Addr) -> protos::AclAction {
     for rule in &acl.rules {
-        let cidr: ipnet::IpNet = match rule.source.parse() {
-            Ok(ipnet::IpNet::V4(v4net)) => {
-                let net = v4net.network().to_ipv6_mapped();
-                let prefix = 96 + v4net.prefix_len();
-                ipnet::IpNet::V6(ipnet::Ipv6Net::new(net, prefix)?)
-            }
-            Ok(c @ ipnet::IpNet::V6(_)) => c,
-            Err(e) => {
-                error!("Invalid rule {rule:?}: {e}");
-                continue;
-            }
-        };
-        if cidr.contains(peer) {
-            return Ok(rule.action());
+        if rule.source.contains(peer) {
+            return rule.action;
         }
     }
-    Ok(acl.default_action())
+    acl.default_action
 }
 
 /// Find correct rule and connect to backend.
@@ -1059,7 +1088,10 @@ async fn route_and_connect(
     mut stream: tokio::net::TcpStream,
     config: &Config,
 ) -> Result<RoutedConnection> {
-    let peer = stream.peer_addr()?.ip();
+    let peer = match stream.peer_addr()?.ip() {
+        std::net::IpAddr::V4(v4) => v4.to_ipv6_mapped(),
+        std::net::IpAddr::V6(v6) => v6,
+    };
     // Read and validate a full TLS ClientHello.
     let (bytes, clienthello) = read_tls_clienthello(&mut stream).await?;
     match clienthello {
@@ -1072,11 +1104,7 @@ async fn route_and_connect(
                         if !is_full_match(&rule.re, &sni) {
                             continue;
                         }
-                        match rule
-                            .acl
-                            .as_ref()
-                            .map_or(Ok(protos::AclAction::Accept), |a| acl_action(&a, &peer))?
-                        {
+                        match acl_action(&rule.acl, &peer) {
                             protos::AclAction::Unspecified => {
                                 error!("Loaded config with ACL with unspecified action");
                                 return Err(anyhow!("unspecified ACL action"));
@@ -1318,6 +1346,10 @@ handshake_timeout_ms: 1234
                 let sockfile = tmp_dir.path().join("tarweb-testing.sock");
                 let backend_sock = tokio::net::UnixDatagram::bind(&sockfile)?;
 
+                let allow_all = Acl {
+                    rules: vec![],
+                    default_action: protos::AclAction::Accept,
+                };
                 // Test config.
                 #[allow(clippy::regex_creation_in_loops)]
                 let config = Config {
@@ -1326,13 +1358,13 @@ handshake_timeout_ms: 1234
                     rules: vec![
                         Rule {
                             re: regex::Regex::new("foo")?,
-                            acl: None,
+                            acl: allow_all.clone(),
                             backend: Backend::Null,
                             timeout: None,
                         },
                         Rule {
                             re: regex::Regex::new("socket")?,
-                            acl: None,
+                            acl: allow_all.clone(),
                             backend: Backend::Pass {
                                 path: sockfile.clone(),
                                 frontend_tls: None,
@@ -1342,7 +1374,7 @@ handshake_timeout_ms: 1234
                         },
                         Rule {
                             re: regex::Regex::new("bar")?,
-                            acl: None,
+                            acl: allow_all.clone(),
                             backend: Backend::Proxy {
                                 addr: format!("[::1]:{backend_bar_port}"),
                                 proxy_header: false,
