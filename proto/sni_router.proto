@@ -2,9 +2,27 @@ syntax = "proto3";
 
 package sni_router;
 
+enum AclAction {
+        UNSPECIFIED = 0;
+        DROP = 1;
+        ACCEPT = 2;
+        CONTINUE = 3;
+}
+
+message AclRule {
+       string source = 1;
+       AclAction action = 2;
+}
+
+message Acl {
+        AclAction default_action = 1;
+        repeated AclRule rules = 2;
+}
+
 message Rule {
         string regex = 1;
         Backend backend = 2;
+        Acl acl = 3;
 }
 
 message Backend {

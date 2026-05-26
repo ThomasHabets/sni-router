@@ -318,6 +318,7 @@ fn load_config(filename: &str, allow_keylogging: bool) -> Result<Config> {
     for rule in protocfg.rules {
         config.rules.push(Rule {
             re: regex::Regex::new(&rule.regex)?,
+            acl: rule.acl,
             timeout: rule.backend.as_ref().and_then(|b| {
                 let t = b.max_lifetime_ms;
                 if t > 0 {
@@ -622,6 +623,10 @@ enum Backend {
 struct Rule {
     re: regex::Regex,
     backend: Backend,
+
+    // TODO: this should be a native struct, not a proto, since we want to
+    // validate it.
+    acl: Option<protos::Acl>,
     timeout: Option<tokio::time::Duration>,
 }
 
@@ -1023,6 +1028,28 @@ fn is_full_match(re: &regex::Regex, text: &str) -> bool {
     }
 }
 
+// TODO: this should not be fallible, after load time verification is done.
+fn acl_action(acl: &protos::Acl, peer: &std::net::IpAddr) -> Result<protos::AclAction> {
+    for rule in &acl.rules {
+        let cidr: ipnet::IpNet = match rule.source.parse() {
+            Ok(ipnet::IpNet::V4(v4net)) => {
+                let net = v4net.network().to_ipv6_mapped();
+                let prefix = 96 + v4net.prefix_len();
+                ipnet::IpNet::V6(ipnet::Ipv6Net::new(net, prefix)?)
+            }
+            Ok(c @ ipnet::IpNet::V6(_)) => c,
+            Err(e) => {
+                error!("Invalid rule {rule:?}: {e}");
+                continue;
+            }
+        };
+        if cidr.contains(peer) {
+            return Ok(rule.action());
+        }
+    }
+    Ok(acl.default_action())
+}
+
 /// Find correct rule and connect to backend.
 ///
 /// This is called under global `max_lifetime_ms` and `handshake_timeout_ms`
@@ -1032,6 +1059,7 @@ async fn route_and_connect(
     mut stream: tokio::net::TcpStream,
     config: &Config,
 ) -> Result<RoutedConnection> {
+    let peer = stream.peer_addr()?.ip();
     // Read and validate a full TLS ClientHello.
     let (bytes, clienthello) = read_tls_clienthello(&mut stream).await?;
     match clienthello {
@@ -1040,23 +1068,38 @@ async fn route_and_connect(
             match extract_sni(&clienthello)? {
                 Some(sni) => {
                     debug!("id={id} SNI: {sni:?}");
-
                     for rule in &config.rules {
-                        if is_full_match(&rule.re, &sni) {
-                            trace!("id={id} SNI {sni} matched rule {rule:?}");
-                            SNI.with_label_values(&[&sni]).inc();
-                            return Ok(RoutedConnection {
-                                backend: connect_or_handoff_backend_with_timeout(
-                                    id,
-                                    stream,
-                                    bytes,
-                                    &rule.backend,
-                                    rule.timeout,
-                                )
-                                .await?,
-                                timeout: rule.timeout,
-                            });
+                        if !is_full_match(&rule.re, &sni) {
+                            continue;
                         }
+                        match rule
+                            .acl
+                            .as_ref()
+                            .map_or(Ok(protos::AclAction::Accept), |a| acl_action(&a, &peer))?
+                        {
+                            protos::AclAction::Unspecified => {
+                                error!("Loaded config with ACL with unspecified action");
+                                return Err(anyhow!("unspecified ACL action"));
+                            }
+                            protos::AclAction::Continue => continue,
+                            protos::AclAction::Drop => {
+                                return Err(anyhow!("{peer:?} rejected by ACL to {}", rule.re));
+                            }
+                            protos::AclAction::Accept => {}
+                        }
+                        trace!("id={id} SNI {sni} matched rule {rule:?}");
+                        SNI.with_label_values(&[&sni]).inc();
+                        return Ok(RoutedConnection {
+                            backend: connect_or_handoff_backend_with_timeout(
+                                id,
+                                stream,
+                                bytes,
+                                &rule.backend,
+                                rule.timeout,
+                            )
+                            .await?,
+                            timeout: rule.timeout,
+                        });
                     }
                     SNI.with_label_values(&[UNKNOWN_SNI]).inc();
                 }
@@ -1283,11 +1326,13 @@ handshake_timeout_ms: 1234
                     rules: vec![
                         Rule {
                             re: regex::Regex::new("foo")?,
+                            acl: None,
                             backend: Backend::Null,
                             timeout: None,
                         },
                         Rule {
                             re: regex::Regex::new("socket")?,
+                            acl: None,
                             backend: Backend::Pass {
                                 path: sockfile.clone(),
                                 frontend_tls: None,
@@ -1297,6 +1342,7 @@ handshake_timeout_ms: 1234
                         },
                         Rule {
                             re: regex::Regex::new("bar")?,
+                            acl: None,
                             backend: Backend::Proxy {
                                 addr: format!("[::1]:{backend_bar_port}"),
                                 proxy_header: false,
