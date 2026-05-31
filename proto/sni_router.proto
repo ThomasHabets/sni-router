@@ -3,26 +3,50 @@ syntax = "proto3";
 package sni_router;
 
 enum AclAction {
+        // Invalid.
         UNSPECIFIED = 0;
+
+        // Drop connection right away.
         DROP = 1;
+
+        // Accept connection.
         ACCEPT = 2;
+
+        // Reject the connection from this rule, but continue to the next Rule.
         CONTINUE = 3;
 }
 
+// The first rule that matches wins.
 message AclRule {
-       string source = 1;
-       AclAction action = 2;
+        // Client address in CIDR format. Supports IPv6 and IPv4.
+        string source = 1;
+
+        // If the above matches, then the ACL ends with this `action`.
+        AclAction action = 2;
 }
 
 message Acl {
+        // If no AclRule matches, do this action.
         AclAction default_action = 1;
+
+        // AclRules in order.
         repeated AclRule rules = 2;
 }
 
 message Rule {
+        // Regex matching SNI (domain). Prefer escaping period, as it otherwise
+        // matches any character. E.g.:
+        //    (www[.]|)example[.]com
+        //
+        // The `default` rule must not have a regex specified, since it matches
+        // everything not previously matched.
         string regex = 1;
-        Backend backend = 2;
-        Acl acl = 3;
+
+        // ACL for the rule. Checked *after* regex, but before anything else.
+        Acl acl = 2;
+
+        // Backend and sorry server.
+        Backend backend = 3;
 
         // Max connection lifetime.
         //
@@ -90,6 +114,7 @@ message SNIConfig {
         // to, or a pass backend has received the file descriptor.
         //
         // This timeout therefore does NOT include any handshake with the
-        // backend. That's covered by the global and per rule max_lifetime_ms.
+        // backend, or frontend TLS. That's covered by the global and per rule
+        // max_lifetime_ms.
         uint64 handshake_timeout_ms = 4;
 }

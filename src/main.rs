@@ -1515,6 +1515,26 @@ handshake_timeout_ms: 1234
         }
     }
 
+    #[test]
+    fn default_cant_have_regex() -> Result<()> {
+        let tmp_dir = tempfile::TempDir::new()?;
+        let config_file = tmp_dir.path().join("config.cfg");
+        std::fs::write(
+            &config_file,
+            r#"
+default: <
+        regex: "xx"
+        backend: <
+            null: <>
+        >
+>
+"#,
+        )?;
+
+        assert!(load_config(config_file.to_str().unwrap(), false).is_err());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn handshake_timeout_stops_after_proxy_backend_connects() -> Result<()> {
         let allow_all = Acl {
