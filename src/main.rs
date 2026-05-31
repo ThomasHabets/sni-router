@@ -319,66 +319,57 @@ fn load_config(filename: &str, allow_keylogging: bool) -> Result<Config> {
             None
         },
         rules: vec![],
-        default_backend: {
-            let (be, frontend_tls, sorry) = protocfg
-                .default_backend
+        default: {
+            let rule = load_rule(
+                &protocfg.default.ok_or(anyhow!("default rule is missing"))?,
+                allow_keylogging,
+            )?;
+            if rule.re.as_str() != "" {
+                return Err(anyhow!("default rule can't have regex"));
+            }
+            rule
+        },
+    };
+    for rule in protocfg.rules {
+        config.rules.push(load_rule(&rule, allow_keylogging)?);
+    }
+    Ok(config)
+}
+
+fn load_rule(rule: &protos::Rule, allow_keylogging: bool) -> Result<Rule> {
+    Ok(Rule {
+        re: regex::Regex::new(&rule.regex)?,
+        acl: rule.acl.as_ref().map_or(
+            Ok(Acl {
+                rules: vec![],
+                default_action: protos::AclAction::Accept,
+            }),
+            |a| load_acl(&a),
+        )?,
+        timeout: {
+            let t = rule.max_lifetime_ms;
+            if t > 0 {
+                Some(tokio::time::Duration::from_millis(t))
+            } else {
+                None
+            }
+        },
+        backend: {
+            let (be, frontend_tls, sorry) = rule
+                .backend
                 .as_ref()
                 .map(|d| (&d.backend_type, d.frontend_tls.as_ref(), d.sorry.as_deref()))
-                .ok_or(anyhow!("Config missing default backend"))?;
+                .ok_or(anyhow!("rule missing backend"))?;
             load_backend(
                 be.as_ref()
-                    .ok_or(anyhow!("default backend missing an actual backend"))?,
+                    .ok_or(anyhow!("backend missing actual backend"))?,
                 frontend_tls,
                 sorry,
                 allow_keylogging,
             )?
         },
-        default_backend_timeout: protocfg.default_backend.and_then(|b| {
-            let t = b.max_lifetime_ms;
-            if t > 0 {
-                Some(tokio::time::Duration::from_millis(b.max_lifetime_ms))
-            } else {
-                None
-            }
-        }),
-    };
-    for rule in protocfg.rules {
-        config.rules.push(Rule {
-            re: regex::Regex::new(&rule.regex)?,
-            acl: rule.acl.map_or(
-                Ok(Acl {
-                    rules: vec![],
-                    default_action: protos::AclAction::Accept,
-                }),
-                |a| load_acl(&a),
-            )?,
-            timeout: rule.backend.as_ref().and_then(|b| {
-                let t = b.max_lifetime_ms;
-                if t > 0 {
-                    Some(tokio::time::Duration::from_millis(b.max_lifetime_ms))
-                } else {
-                    None
-                }
-            }),
-            backend: {
-                let (be, frontend_tls, sorry) = rule
-                    .backend
-                    .as_ref()
-                    .map(|d| (&d.backend_type, d.frontend_tls.as_ref(), d.sorry.as_deref()))
-                    .ok_or(anyhow!("rule missing backend"))?;
-                load_backend(
-                    be.as_ref()
-                        .ok_or(anyhow!("backend missing actual backend"))?,
-                    frontend_tls,
-                    sorry,
-                    allow_keylogging,
-                )?
-            },
-        });
-    }
-    Ok(config)
+    })
 }
-
 /// Read enough bytes from `stream` to cover the entire TLS `ClientHello` handshake
 /// (which may span multiple records). Returns the handshake (type+len+body).
 ///
@@ -677,11 +668,7 @@ struct Config {
     max_lifetime: Option<tokio::time::Duration>,
     handshake_timeout: Option<tokio::time::Duration>,
     rules: Vec<Rule>,
-    default_backend: Backend,
-
-    // This is a bit weird looking since timeout is part of the Backend in the
-    // proto, but part of the Rule in the proto.
-    default_backend_timeout: Option<tokio::time::Duration>,
+    default: Rule,
 }
 
 /// After going through rules, sorries and backups, we have finally found and
@@ -1152,11 +1139,11 @@ async fn route_and_connect(
             id,
             stream,
             bytes,
-            &config.default_backend,
-            config.default_backend_timeout,
+            &config.default.backend,
+            config.default.timeout,
         )
         .await?,
-        timeout: config.default_backend_timeout,
+        timeout: config.default.timeout,
     })
 }
 
@@ -1180,7 +1167,7 @@ async fn handle_conn(id: usize, stream: tokio::net::TcpStream, config: &Config) 
         tokio::select! {
             res = fut => { res },
             _ = to => {
-                Err(anyhow::anyhow!("Connection to SNI {} timed out", routed.sni.unwrap_or("<no SNI>".to_string())))
+                Err(anyhow!("Connection to SNI {} timed out", routed.sni.unwrap_or("<no SNI>".to_string())))
             }
         }
     } else {
@@ -1314,8 +1301,10 @@ mod tests {
         std::fs::write(
             &config_file,
             r#"
-default_backend: <
-        null: <>
+default: <
+        backend: <
+            null: <>
+        >
 >
 handshake_timeout_ms: 1234
 "#,
@@ -1396,13 +1385,17 @@ handshake_timeout_ms: 1234
                             timeout: None,
                         },
                     ],
-                    default_backend: Backend::Proxy {
-                        addr: format!("[::1]:{backend_baz_port}"),
-                        proxy_header: false,
-                        frontend_tls: None,
-                        sorry: None,
+                    default: Rule {
+                        acl: allow_all.clone(),
+                        re: regex::Regex::new("xxx not used xxx")?,
+                        timeout: None,
+                        backend: Backend::Proxy {
+                            addr: format!("[::1]:{backend_baz_port}"),
+                            proxy_header: false,
+                            frontend_tls: None,
+                            sorry: None,
+                        },
                     },
-                    default_backend_timeout: None,
                 };
                 let _main = tokio::task::spawn(async move {
                     mainloop(Arc::new(config), "", listener, false).await
@@ -1489,14 +1482,22 @@ handshake_timeout_ms: 1234
 
     #[tokio::test]
     async fn handshake_timeout_closes_idle_preroute_client() -> Result<()> {
+        let allow_all = Acl {
+            rules: vec![],
+            default_action: protos::AclAction::Accept,
+        };
         let listener = tokio::net::TcpListener::bind("[::1]:0".parse::<SocketAddr>()?).await?;
         let listener_port = listener.local_addr()?.port();
         let config = Config {
             max_lifetime: Some(MAX_TEST_CONNECTION_TIME),
             handshake_timeout: Some(tokio::time::Duration::from_millis(50)),
             rules: vec![],
-            default_backend: Backend::Null,
-            default_backend_timeout: None,
+            default: Rule {
+                acl: allow_all.clone(),
+                timeout: None,
+                re: regex::Regex::new("xxx not used xxx")?,
+                backend: Backend::Null,
+            },
         };
         let _main =
             tokio::task::spawn(
@@ -1516,6 +1517,10 @@ handshake_timeout_ms: 1234
 
     #[tokio::test]
     async fn handshake_timeout_stops_after_proxy_backend_connects() -> Result<()> {
+        let allow_all = Acl {
+            rules: vec![],
+            default_action: protos::AclAction::Accept,
+        };
         let listener = tokio::net::TcpListener::bind("[::1]:0".parse::<SocketAddr>()?).await?;
         let listener_port = listener.local_addr()?.port();
         let backend = tokio::net::TcpListener::bind("[::1]:0".parse::<SocketAddr>()?).await?;
@@ -1524,13 +1529,17 @@ handshake_timeout_ms: 1234
             max_lifetime: Some(MAX_TEST_CONNECTION_TIME),
             handshake_timeout: Some(tokio::time::Duration::from_millis(50)),
             rules: vec![],
-            default_backend: Backend::Proxy {
-                addr: format!("[::1]:{backend_port}"),
-                proxy_header: false,
-                frontend_tls: None,
-                sorry: None,
+            default: Rule {
+                acl: allow_all.clone(),
+                timeout: None,
+                re: regex::Regex::new("xxx not used xxx")?,
+                backend: Backend::Proxy {
+                    addr: format!("[::1]:{backend_port}"),
+                    proxy_header: false,
+                    frontend_tls: None,
+                    sorry: None,
+                },
             },
-            default_backend_timeout: None,
         };
         let _main =
             tokio::task::spawn(

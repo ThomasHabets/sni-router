@@ -23,6 +23,16 @@ message Rule {
         string regex = 1;
         Backend backend = 2;
         Acl acl = 3;
+
+        // Max connection lifetime.
+        //
+        // For Proxy backends this is more real than for Pass backends.
+        //
+        // For Pass backends it's basically just the `ClientHello` snoop time,
+        // unless it's also the TLS handshake time or the unix socket write
+        // blocks because the server is full or something. There's no timing out
+        // after the FD has been handed off.
+        uint64 max_lifetime_ms = 4;
 }
 
 message Backend {
@@ -45,20 +55,7 @@ message Backend {
                 Pass pass = 3;
         }
 
-        // Max connection lifetime.
-        //
-        // For Proxy backends this is more real than for Pass backends.
-        //
-        // For Pass backends it's basically just the `ClientHello` snoop time,
-        // unless it's also the TLS handshake time or the unix socket write
-        // blocks because the server is full or something. There's no timing out
-        // after the FD has been handed off.
-        uint64 max_lifetime_ms = 4;
-
         // Sorry backend. Used if connecting to the backend fails.
-        //
-        // The sorry backend timeout falls under its main backend
-        // timeout/lifetime.
         Backend sorry = 5;
 
         // Enabling frontend TLS causes the SNI router to complete the handshake
@@ -75,11 +72,14 @@ message Backend {
 
 message SNIConfig {
         repeated Rule rules = 1;
-        Backend default_backend = 2;
+        Rule default = 2;
 
-        // See comment on field in Backend message.
+        // See comment on field in Rule message.
         // But since this is top level, this applies to waiting for the
         // ClientHello too.
+        //
+        // No connection (not handed off to Pass) will ever live longer than
+        // this.
         uint64 max_lifetime_ms = 3;
 
         // Timeout for the pre-backend phase: reading enough of the TLS
