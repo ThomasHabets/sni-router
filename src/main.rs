@@ -1310,12 +1310,16 @@ mod tests {
 
     const MAX_TEST_CONNECTION_TIME: tokio::time::Duration = tokio::time::Duration::from_secs(5);
 
-    #[test]
-    fn config_loads_handshake_timeout() -> Result<()> {
+    fn make_config(s: &str) -> Result<Config> {
         let tmp_dir = tempfile::TempDir::new()?;
         let config_file = tmp_dir.path().join("config.cfg");
-        std::fs::write(
-            &config_file,
+        std::fs::write(&config_file, s)?;
+        load_config(config_file.to_str().unwrap(), false)
+    }
+
+    #[test]
+    fn config_loads_handshake_timeout() -> Result<()> {
+        let config = make_config(
             r#"
 default: <
         backend: <
@@ -1325,8 +1329,6 @@ default: <
 handshake_timeout_ms: 1234
 "#,
         )?;
-
-        let config = load_config(config_file.to_str().unwrap(), false)?;
         assert_eq!(
             config.handshake_timeout,
             Some(tokio::time::Duration::from_millis(1234))
@@ -1363,56 +1365,43 @@ handshake_timeout_ms: 1234
                 let sockfile = tmp_dir.path().join("tarweb-testing.sock");
                 let backend_sock = tokio::net::UnixDatagram::bind(&sockfile)?;
 
-                let allow_all = Acl {
-                    rules: vec![],
-                    default_action: protos::AclAction::Accept,
-                };
                 // Test config.
-                #[allow(clippy::regex_creation_in_loops)]
-                let config = Config {
-                    max_lifetime: Some(MAX_TEST_CONNECTION_TIME),
-                    handshake_timeout: None,
-                    rules: vec![
-                        Rule {
-                            re: regex::Regex::new("foo")?,
-                            acl: allow_all.clone(),
-                            backend: Backend::Null,
-                            timeout: None,
-                        },
-                        Rule {
-                            re: regex::Regex::new("socket")?,
-                            acl: allow_all.clone(),
-                            backend: Backend::Pass {
-                                path: sockfile.clone(),
-                                frontend_tls: None,
-                                sorry: None,
-                            },
-                            timeout: None,
-                        },
-                        Rule {
-                            re: regex::Regex::new("bar")?,
-                            acl: allow_all.clone(),
-                            backend: Backend::Proxy {
-                                addr: format!("[::1]:{backend_bar_port}"),
-                                proxy_header: false,
-                                frontend_tls: None,
-                                sorry: None,
-                            },
-                            timeout: None,
-                        },
-                    ],
-                    default: Rule {
-                        acl: allow_all.clone(),
-                        re: regex::Regex::new("xxx not used xxx")?,
-                        timeout: None,
-                        backend: Backend::Proxy {
-                            addr: format!("[::1]:{backend_baz_port}"),
-                            proxy_header: false,
-                            frontend_tls: None,
-                            sorry: None,
-                        },
-                    },
-                };
+                let config = make_config(&format!(
+                    r#"
+                max_lifetime_ms: {}
+                rules: <
+                    regex: "foo"
+                    backend: <
+                        null: <>
+                    >
+                >
+                rules: <
+                    regex: "socket"
+                    backend: <
+                        pass: <
+                            path: "{}"
+                        >
+                    >
+                >
+                rules: <
+                    regex: "bar"
+                    backend: <
+                        proxy: <
+                            addr: "[::1]:{backend_bar_port}"
+                        >
+                    >
+                >
+                default: <
+                    backend: <
+                        proxy: <
+                            addr: "[::1]:{backend_baz_port}"
+                        >
+                    >
+                >
+                "#,
+                    MAX_TEST_CONNECTION_TIME.as_millis(),
+                    sockfile.display()
+                ))?;
                 let _main = tokio::task::spawn(async move {
                     mainloop(Arc::new(config), "", listener, false).await
                 });
@@ -1498,23 +1487,20 @@ handshake_timeout_ms: 1234
 
     #[tokio::test]
     async fn handshake_timeout_closes_idle_preroute_client() -> Result<()> {
-        let allow_all = Acl {
-            rules: vec![],
-            default_action: protos::AclAction::Accept,
-        };
         let listener = tokio::net::TcpListener::bind("[::1]:0".parse::<SocketAddr>()?).await?;
         let listener_port = listener.local_addr()?.port();
-        let config = Config {
-            max_lifetime: Some(MAX_TEST_CONNECTION_TIME),
-            handshake_timeout: Some(tokio::time::Duration::from_millis(50)),
-            rules: vec![],
-            default: Rule {
-                acl: allow_all.clone(),
-                timeout: None,
-                re: regex::Regex::new("xxx not used xxx")?,
-                backend: Backend::Null,
-            },
-        };
+        let config = make_config(&format!(
+            r#"
+        max_lifetime_ms: {}
+        handshake_timeout_ms: 50
+        default: <
+            backend: <
+                null: <>
+            >
+        >
+        "#,
+            MAX_TEST_CONNECTION_TIME.as_millis()
+        ))?;
         let _main =
             tokio::task::spawn(
                 async move { mainloop(Arc::new(config), "", listener, false).await },
@@ -1533,10 +1519,23 @@ handshake_timeout_ms: 1234
 
     #[test]
     fn default_cant_have_regex() -> Result<()> {
-        let tmp_dir = tempfile::TempDir::new()?;
-        let config_file = tmp_dir.path().join("config.cfg");
-        std::fs::write(
-            &config_file,
+        let c = make_config(
+            r#"
+default: <
+        regex: "xxx"
+        backend: <
+            null: <>
+        >
+>
+"#,
+        );
+        assert!(c.is_err(), "Got config: {c:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn default_cant_have_regex_even_empty() -> Result<()> {
+        let c = make_config(
             r#"
 default: <
         regex: ""
@@ -1545,38 +1544,31 @@ default: <
         >
 >
 "#,
-        )?;
-        let c = load_config(config_file.to_str().unwrap(), false);
+        );
         assert!(c.is_err(), "Got config: {c:?}");
         Ok(())
     }
 
     #[tokio::test]
     async fn handshake_timeout_stops_after_proxy_backend_connects() -> Result<()> {
-        let allow_all = Acl {
-            rules: vec![],
-            default_action: protos::AclAction::Accept,
-        };
         let listener = tokio::net::TcpListener::bind("[::1]:0".parse::<SocketAddr>()?).await?;
         let listener_port = listener.local_addr()?.port();
         let backend = tokio::net::TcpListener::bind("[::1]:0".parse::<SocketAddr>()?).await?;
         let backend_port = backend.local_addr()?.port();
-        let config = Config {
-            max_lifetime: Some(MAX_TEST_CONNECTION_TIME),
-            handshake_timeout: Some(tokio::time::Duration::from_millis(50)),
-            rules: vec![],
-            default: Rule {
-                acl: allow_all.clone(),
-                timeout: None,
-                re: regex::Regex::new("xxx not used xxx")?,
-                backend: Backend::Proxy {
-                    addr: format!("[::1]:{backend_port}"),
-                    proxy_header: false,
-                    frontend_tls: None,
-                    sorry: None,
-                },
-            },
-        };
+        let config = make_config(&format!(
+            r#"
+        max_lifetime_ms: {}
+        handshake_timeout_ms: 10000
+        default: <
+            backend: <
+                proxy: <
+                    addr: "[::1]:{backend_port}"
+                >
+            >
+        >
+        "#,
+            MAX_TEST_CONNECTION_TIME.as_millis()
+        ))?;
         let _main =
             tokio::task::spawn(
                 async move { mainloop(Arc::new(config), "", listener, false).await },
