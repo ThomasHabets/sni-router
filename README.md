@@ -80,12 +80,14 @@ rules: <
                 >
         >
 >
-default_backend: <
-        # For all other traffic, pass to an nginx port that uses the PROXY
-        # protocol. Let that backend deal with TLS handshake and stuff.
-        proxy: <
-                addr: "localhost:444"
-                proxy_header: true,
+default: <
+        backend: <
+                # For all other traffic, pass to an nginx port that uses the PROXY
+                # protocol. Let that backend deal with TLS handshake and stuff.
+                proxy: <
+                        addr: "localhost:444"
+                        proxy_header: true,
+                >
         >
 >
 ```
