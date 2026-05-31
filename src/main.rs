@@ -690,6 +690,7 @@ struct Config {
 /// is, nor does the connection loop need to know, so `ConnectedBackend` doesn't
 /// contain the timeout.
 struct RoutedConnection {
+    sni: Option<String>,
     backend: ConnectedBackend,
     timeout: Option<tokio::time::Duration>,
 }
@@ -1104,6 +1105,7 @@ async fn route_and_connect(
                         if !is_full_match(&rule.re, &sni) {
                             continue;
                         }
+                        trace!("id={id} SNI {sni} matched rule {rule:?}");
                         match acl_action(&rule.acl, &peer) {
                             protos::AclAction::Unspecified => {
                                 error!("Loaded config with ACL with unspecified action");
@@ -1115,9 +1117,9 @@ async fn route_and_connect(
                             }
                             protos::AclAction::Accept => {}
                         }
-                        trace!("id={id} SNI {sni} matched rule {rule:?}");
                         SNI.with_label_values(&[&sni]).inc();
                         return Ok(RoutedConnection {
+                            sni: Some(sni),
                             backend: connect_or_handoff_backend_with_timeout(
                                 id,
                                 stream,
@@ -1142,6 +1144,7 @@ async fn route_and_connect(
         }
     }
     Ok(RoutedConnection {
+        sni: None,
         backend: connect_or_handoff_backend_with_timeout(
             id,
             stream,
@@ -1170,7 +1173,13 @@ async fn handle_conn(id: usize, stream: tokio::net::TcpStream, config: &Config) 
 
     let fut = handle_connected_backend(id, routed.backend);
     if let Some(timeout) = routed.timeout {
-        tokio::time::timeout(timeout, fut).await?
+        let to = tokio::time::sleep(timeout);
+        tokio::select! {
+            res = fut => { res },
+            _ = to => {
+                Err(anyhow::anyhow!("Connection to SNI {} timed out", routed.sni.unwrap_or("<no SNI>".to_string())))
+            }
+        }
     } else {
         fut.await
     }
@@ -1214,7 +1223,7 @@ async fn mainloop(
             let res = if let Some(timeout) = config.max_lifetime {
                 match tokio::time::timeout(timeout, fut).await {
                     Ok(o) => o,
-                    Err(e) => Err(anyhow!("connection timeout for peer {peer}: {e}")),
+                    Err(e) => Err(anyhow!("global connection timeout: {e}")),
                 }
             } else {
                 fut.await
