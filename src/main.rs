@@ -678,6 +678,9 @@ struct Config {
     handshake_timeout: Option<tokio::time::Duration>,
     rules: Vec<Rule>,
     default_backend: Backend,
+
+    // This is a bit weird looking since timeout is part of the Backend in the
+    // proto, but part of the Rule in the proto.
     default_backend_timeout: Option<tokio::time::Duration>,
 }
 

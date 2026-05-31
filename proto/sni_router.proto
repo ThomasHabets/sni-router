@@ -50,11 +50,15 @@ message Backend {
         // For Proxy backends this is more real than for Pass backends.
         //
         // For Pass backends it's basically just the `ClientHello` snoop time,
-        // unless it's also the TLS handshake time. There's no timing out after
-        // the FD has been handed off.
+        // unless it's also the TLS handshake time or the unix socket write
+        // blocks because the server is full or something. There's no timing out
+        // after the FD has been handed off.
         uint64 max_lifetime_ms = 4;
 
         // Sorry backend. Used if connecting to the backend fails.
+        //
+        // The sorry backend timeout falls under its main backend
+        // timeout/lifetime.
         Backend sorry = 5;
 
         // Enabling frontend TLS causes the SNI router to complete the handshake
