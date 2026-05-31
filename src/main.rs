@@ -233,6 +233,9 @@ fn load_acl(pb: &protos::Acl) -> Result<Acl> {
             }
             ipnet::IpNet::V6(v6) => v6,
         };
+        if rule.action() == protos::AclAction::Unspecified {
+            return Err(anyhow!("ACL action can't be 'UNSPECIFIED'"));
+        }
         rules.push(AclRule {
             source,
             action: rule.action().clone(),
