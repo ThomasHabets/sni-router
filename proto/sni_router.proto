@@ -40,7 +40,7 @@ message Rule {
         //
         // The `default` rule must not have a regex specified, since it matches
         // everything not previously matched.
-        string regex = 1;
+        optional string regex = 1;
 
         // ACL for the rule. Checked *after* regex, but before anything else.
         Acl acl = 2;

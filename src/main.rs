@@ -325,6 +325,7 @@ fn load_config(filename: &str, allow_keylogging: bool) -> Result<Config> {
         default: {
             let rule = load_rule(
                 &protocfg.default.ok_or(anyhow!("default rule is missing"))?,
+                true,
                 allow_keylogging,
             )?;
             if rule.re.as_str() != "" {
@@ -334,14 +335,26 @@ fn load_config(filename: &str, allow_keylogging: bool) -> Result<Config> {
         },
     };
     for rule in protocfg.rules {
-        config.rules.push(load_rule(&rule, allow_keylogging)?);
+        config
+            .rules
+            .push(load_rule(&rule, false, allow_keylogging)?);
     }
     Ok(config)
 }
 
-fn load_rule(rule: &protos::Rule, allow_keylogging: bool) -> Result<Rule> {
+fn load_rule(rule: &protos::Rule, is_default: bool, allow_keylogging: bool) -> Result<Rule> {
+    let re = if is_default {
+        if let Some(r) = rule.regex.as_ref() {
+            return Err(anyhow!("default rule can't have regex. Had {r}"));
+        }
+        ""
+    } else {
+        rule.regex
+            .as_ref()
+            .ok_or(anyhow!("No regex supplied in rule"))?
+    };
     Ok(Rule {
-        re: regex::Regex::new(&rule.regex)?,
+        re: regex::Regex::new(re)?,
         acl: rule.acl.as_ref().map_or(
             Ok(Acl {
                 rules: vec![],
@@ -1526,15 +1539,15 @@ handshake_timeout_ms: 1234
             &config_file,
             r#"
 default: <
-        regex: "xx"
+        regex: ""
         backend: <
             null: <>
         >
 >
 "#,
         )?;
-
-        assert!(load_config(config_file.to_str().unwrap(), false).is_err());
+        let c = load_config(config_file.to_str().unwrap(), false);
+        assert!(c.is_err(), "Got config: {c:?}");
         Ok(())
     }
 
