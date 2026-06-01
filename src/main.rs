@@ -1478,8 +1478,13 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .event_format(tracing_subscriber::fmt::format().with_ansi(false))
         .init();
+    let profile = if cfg!(debug_assertions) {
+        "DEBUG"
+    } else {
+        "RELEASE"
+    };
     info!(
-        "SNI Router {} built with {}",
+        "SNI Router {} built with {} in mode {profile}",
         env!("GIT_VERSION"),
         env!("RUSTC_VERSION")
     );
