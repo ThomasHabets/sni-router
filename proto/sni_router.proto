@@ -63,6 +63,9 @@ message Backend {
         message Tls {
                 string cert_file = 1;
                 string key_file = 2;
+
+                // If set, require clients to present a cert signed by this CA.
+                string mtls_ca = 3;
         }
         message Null {
         }

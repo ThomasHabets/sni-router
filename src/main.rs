@@ -191,23 +191,45 @@ struct Opt {
     config: String,
 }
 
+fn load_root_store(path: &str) -> Result<rustls::RootCertStore> {
+    let mut roots = rustls::RootCertStore::empty();
+
+    for cert in load_certs(path)? {
+        roots
+            .add(cert)
+            .with_context(|| format!("add CA cert from {path}"))?;
+    }
+
+    Ok(roots)
+}
+
 /// Load TLS data from files as specified in the proto part.
 #[allow(clippy::unnecessary_wraps)]
 fn load_tls(
-    cfg: Option<&protos::backend::Tls>,
+    pb: Option<&protos::backend::Tls>,
     allow_keylogging: bool,
 ) -> Result<Option<Arc<rustls::ServerConfig>>> {
-    let Some(cfg) = cfg else {
+    let Some(pb) = pb else {
         return Ok(None);
     };
-    let certs = load_certs(&cfg.cert_file)?;
-    let key = load_private_key(&cfg.key_file)?;
+    let certs = load_certs(&pb.cert_file)?;
+    let key = load_private_key(&pb.key_file)?;
     Ok(Some(Arc::new({
-        let mut cfg = rustls::ServerConfig::builder_with_protocol_versions(&[
+        let cfg = rustls::ServerConfig::builder_with_protocol_versions(&[
             &rustls::version::TLS12,
             &rustls::version::TLS13,
-        ])
-        .with_no_client_auth()
+        ]);
+        let mut cfg = if pb.mtls_ca.is_empty() {
+            cfg.with_no_client_auth()
+        } else {
+            let client_roots = Arc::new(load_root_store(&pb.mtls_ca)?);
+
+            let verifier = rustls::server::WebPkiClientVerifier::builder(client_roots)
+                .build()
+                .context("build client cert verifier")?;
+
+            cfg.with_client_cert_verifier(verifier)
+        }
         .with_single_cert(certs, key)?;
         cfg.enable_secret_extraction = true;
         // Enable key log file to file named from env SSLKEYLOGFILE.
