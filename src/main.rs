@@ -105,14 +105,14 @@ static HOSTNAME: LazyLock<String> = LazyLock::new(|| {
         })
 });
 
-fn push_metrics() -> Result<()> {
+fn push_metrics(job: &str, url: &str) -> Result<()> {
     info!("Pushing metrics");
     let grouping = std::collections::HashMap::from([("instance".to_string(), (*HOSTNAME).clone())]);
 
     prometheus::push_metrics(
-        "sni-router",            // job name
-        grouping,                // grouping labels
-        "http://localhost:9091", // Pushgateway URL
+        job,
+        grouping, // grouping labels
+        url,
         REGISTRY.gather(),
         None, // optional basic auth
     )?;
@@ -214,6 +214,14 @@ struct Opt {
     /// Asciiproto config.
     #[arg(long, short)]
     config: String,
+
+    /// Prometheus push gateway url. E.g. http://localhost:9091.
+    #[arg(long)]
+    prometheus: Option<String>,
+
+    /// Prometheus job name.
+    #[arg(long, default_value = "sni-router")]
+    prometheus_job: String,
 }
 
 fn load_root_store(path: &str) -> Result<rustls::RootCertStore> {
@@ -1544,18 +1552,23 @@ async fn main() -> Result<()> {
     // Config.
     let config = load_config(&opt.config, opt.allow_keylogging)
         .context(format!("Loading config {:?}", opt.config))?;
-    std::thread::Builder::new()
-        .name("prometheus-pusher".to_string())
-        .spawn(move || {
-            loop {
-                if let Err(err) = push_metrics() {
-                    eprintln!("failed to push prometheus metrics: {err}");
-                }
 
-                std::thread::sleep(std::time::Duration::from_mins(1));
-            }
-        })
-        .expect("spawn prometheus pusher thread");
+    if let Some(url) = &opt.prometheus {
+        let url = url.clone();
+        let job = opt.prometheus_job.clone();
+        std::thread::Builder::new()
+            .name("prometheus-pusher".to_string())
+            .spawn(move || {
+                loop {
+                    if let Err(err) = push_metrics(&job, &url) {
+                        eprintln!("failed to push prometheus metrics: {err}");
+                    }
+
+                    std::thread::sleep(std::time::Duration::from_mins(1));
+                }
+            })
+            .expect("spawn prometheus pusher thread");
+    }
     mainloop(
         Arc::new(config),
         &opt.config,
