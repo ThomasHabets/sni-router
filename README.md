@@ -116,3 +116,13 @@ The two main benefits are:
 2. SNI Router can be restarted without interrupting existing connections.
 3. The backend has direct access to the underlying socket, and can therefore get
    the real client IP address.
+
+SNI Router can also listen on the same Unix datagram handoff protocol:
+
+```
+sni-router --listen-unix-datagram pass.sock --config backend.conf
+```
+
+That lets one SNI Router use `pass: < path: "pass.sock" >` with another SNI
+Router as the backend. The receiving router uses the passed TCP fd plus the
+initial bytes from the datagram and then applies its normal SNI routing rules.

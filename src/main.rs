@@ -1,7 +1,8 @@
 //! # SNI router.
 //!
-//! TCP terminating server that snoops on TLS SNI, and then passes the FD on to
-//! another server, like [tarweb][tarweb]. Or if the other server doesn't
+//! Server that snoops on TLS SNI from TCP connections, or from TCP file
+//! descriptors received over a Unix datagram socket, and then passes the FD on
+//! to another server, like [tarweb][tarweb]. Or if the other server doesn't
 //! support FD passing, it proxies the connection via the PROXY v1 protocol.
 //!
 //! The idea here is to actually make different routing decisions based on SNI,
@@ -33,7 +34,7 @@
 #![allow(clippy::similar_names)]
 
 use std::net::ToSocketAddrs;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -59,6 +60,8 @@ mod protos {
 
 // How much capacity to prepare for ClientHello and stuff.
 const BUF_CAPACITY: usize = 2048;
+const UDS_DGRAM_BUF_CAPACITY: usize = 64 * 1024;
+const UDS_CMSG_FD_CAPACITY: usize = 253;
 const UNKNOWN_SNI: &str = "<unknown>";
 const MISSING_SNI: &str = "<missing>";
 
@@ -174,9 +177,13 @@ struct Opt {
     #[arg(long, short, default_value = "info")]
     verbose: String,
 
-    /// Address to listen to.
-    #[arg(long, short, default_value = "[::]:443")]
-    listen: std::net::SocketAddr,
+    /// TCP address to listen to. Defaults to [::]:443.
+    #[arg(long, short, conflicts_with = "listen_unix_datagram")]
+    listen: Option<std::net::SocketAddr>,
+
+    /// Unix datagram socket path to receive SCM_RIGHTS handoffs on instead of TCP accepts.
+    #[arg(long, value_name = "PATH")]
+    listen_unix_datagram: Option<std::path::PathBuf>,
 
     /// Restrict router to only be able to read under this directory.
     #[arg(long, default_value = "/")]
@@ -409,8 +416,29 @@ fn load_rule(rule: &protos::Rule, is_default: bool, allow_keylogging: bool) -> R
         },
     })
 }
-/// Read enough bytes from `stream` to cover the entire TLS `ClientHello` handshake
-/// (which may span multiple records). Returns the handshake (type+len+body).
+
+/// If needed, read more bytes into `bytes`. If less than `len` can be read,
+/// that's an error.
+async fn ensure_bytes_available(
+    stream: &mut tokio::net::TcpStream,
+    bytes: &mut Vec<u8>,
+    len: usize,
+) -> Result<()> {
+    if bytes.len() >= len {
+        return Ok(());
+    }
+    let old_len = bytes.len();
+    bytes.resize(len, 0);
+    if let Err(e) = stream.read_exact(&mut bytes[old_len..]).await {
+        bytes.truncate(old_len);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
+/// Read enough bytes from `stream` and `initial_bytes` to cover the entire TLS
+/// `ClientHello` handshake (which may span multiple records). Returns the
+/// handshake (type+len+body).
 ///
 /// TLS record format:
 ///   - 5B header: `content_type(1)=22`, `legacy_version(2)`, length(2)
@@ -420,34 +448,37 @@ fn load_rule(rule: &protos::Rule, is_default: bool, allow_keylogging: bool) -> R
 ///   - `msg_type(1)=1(ClientHello)`
 ///   - length(3) = `body_len`
 ///
-/// Return all bytes read, and clienthello bytes.
+/// Return all bytes read or supplied, and clienthello bytes.
 ///
 /// This function is mostly AI coded for the parsing parts. Seems to work, and
 /// reviewing it it seems safe.
 async fn read_tls_clienthello(
     stream: &mut tokio::net::TcpStream,
+    initial_bytes: Vec<u8>,
 ) -> Result<(Vec<u8>, Result<Vec<u8>>)> {
     const REC_HDR_LEN: usize = 5;
     let mut hello = Vec::with_capacity(BUF_CAPACITY);
-    let mut bytes = Vec::with_capacity(BUF_CAPACITY);
+    let mut bytes = initial_bytes;
+    if bytes.capacity() < BUF_CAPACITY {
+        bytes.reserve(BUF_CAPACITY - bytes.capacity());
+    }
+    let mut pos = 0;
 
     // We need at least first record to see handshake header (type + 3-byte len).
     // Loop records until we have full ClientHello bytes (4 + body_len).
     let mut needed: Option<usize> = None;
 
     while needed.is_none_or(|n| hello.len() < n) {
-        // Read record header.
-        let mut rec_hdr = [0u8; REC_HDR_LEN];
-        stream
-            .read_exact(&mut rec_hdr)
+        ensure_bytes_available(stream, &mut bytes, pos + REC_HDR_LEN)
             .await
-            .context("read TLS record header")?;
-        bytes.extend(rec_hdr);
+            .context("reading TLS record header bytes")?;
 
         // Parse header.
+        let rec_hdr = &bytes[pos..pos + REC_HDR_LEN];
         let content_type = rec_hdr[0];
         let _legacy_ver = u16::from_be_bytes([rec_hdr[1], rec_hdr[2]]);
         let rec_len = u16::from_be_bytes([rec_hdr[3], rec_hdr[4]]) as usize;
+        pos += REC_HDR_LEN;
 
         // Confirm it's Handshake.
         if content_type != 22 {
@@ -462,16 +493,13 @@ async fn read_tls_clienthello(
             return Ok((bytes, Err(anyhow!("zero-length TLS record"))));
         }
 
-        // Read whole record.
-        let mut rec_payload = vec![0u8; rec_len];
-        stream
-            .read_exact(&mut rec_payload)
+        ensure_bytes_available(stream, &mut bytes, pos + rec_len)
             .await
-            .context("read TLS record payload")?;
+            .context("reading TLS record payload bytes")?;
 
         // Append to handshake buffer (could contain partial or full ClientHello).
-        hello.extend(&rec_payload);
-        bytes.extend(&rec_payload);
+        hello.extend_from_slice(&bytes[pos..pos + rec_len]);
+        pos += rec_len;
 
         // If we haven't established how many bytes we need, try now.
         if needed.is_none() {
@@ -495,9 +523,14 @@ async fn read_tls_clienthello(
     }
 
     // Truncate to exactly the ClientHello (in case next record started).
-    // TODO: that's impossible, right?
+    // TODO: that's impossible, right? We only extend_from_slice'd the record as
+    // its actual size is?
     let n = needed.unwrap();
     if hello.len() > n {
+        error!(
+            "Hello record became {} bytes, apparently. Expected {n}",
+            hello.len()
+        );
         hello.truncate(n);
     }
     Ok((bytes, Ok(hello)))
@@ -541,10 +574,87 @@ async fn pass_fd_over_uds(
     Ok(())
 }
 
+/// Convert a fd received over unix socket to tokio TcpStream.
+fn tcp_stream_from_received_fd(fd: OwnedFd) -> std::io::Result<tokio::net::TcpStream> {
+    let stream = unsafe { std::net::TcpStream::from_raw_fd(fd.into_raw_fd()) };
+    stream.set_nonblocking(true)?;
+    tokio::net::TcpStream::from_std(stream)
+}
+
+/// Tokio says reading will not block, so let's read a file descriptor and its
+/// data.
+///
+/// This function is not subject to timeout, since the initial data comes
+/// entirely in the sole datagram.
+fn recv_fd_over_uds_now(sock: &UnixDatagram) -> std::io::Result<(tokio::net::TcpStream, Vec<u8>)> {
+    use nix::errno::Errno;
+    use nix::sys::socket::{ControlMessageOwned, MsgFlags, recvmsg};
+
+    let mut buf = vec![0u8; UDS_DGRAM_BUF_CAPACITY];
+
+    let (bytes, flags, mut fds) = {
+        let mut iov = [std::io::IoSliceMut::new(&mut buf)];
+        let mut cmsgspace = nix::cmsg_space!([RawFd; UDS_CMSG_FD_CAPACITY]);
+        let msg = match recvmsg::<()>(
+            sock.as_raw_fd(),
+            &mut iov,
+            Some(&mut cmsgspace),
+            MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_CMSG_CLOEXEC,
+        ) {
+            Ok(msg) => msg,
+            Err(Errno::EAGAIN) => return Err(std::io::ErrorKind::WouldBlock.into()),
+            Err(e) => return Err(std::io::Error::from_raw_os_error(e as i32)),
+        };
+        let mut fds = Vec::new();
+        let cmsgs = msg
+            .cmsgs()
+            .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+        for cmsg in cmsgs {
+            if let ControlMessageOwned::ScmRights(raw_fds) = cmsg {
+                for fd in raw_fds {
+                    fds.push(unsafe { OwnedFd::from_raw_fd(fd) });
+                }
+            }
+        }
+        (msg.bytes, msg.flags, fds)
+    };
+
+    if flags.contains(nix::sys::socket::MsgFlags::MSG_TRUNC) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "UDS datagram data truncated at {} bytes",
+                UDS_DGRAM_BUF_CAPACITY
+            ),
+        ));
+    }
+    if flags.contains(nix::sys::socket::MsgFlags::MSG_CTRUNC) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "UDS datagram control data truncated".to_string(),
+        ));
+    }
+    if fds.len() != 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("expected exactly one passed fd, got {}", fds.len()),
+        ));
+    }
+    buf.truncate(bytes);
+    let stream = tcp_stream_from_received_fd(fds.pop().unwrap())?;
+    Ok((stream, buf))
+}
+
+async fn recv_fd_over_uds(sock: &UnixDatagram) -> Result<(tokio::net::TcpStream, Vec<u8>)> {
+    sock.async_io(tokio::io::Interest::READABLE, || recv_fd_over_uds_now(sock))
+        .await
+        .context("recvmsg SCM_RIGHTS")
+}
+
 /// Extract SNI `host_name` from a TLS `ClientHello` (handshake header + body).
 /// Returns Ok(Some(host)) if found, Ok(None) if no SNI extension exists.
 ///
-/// This function is mostly jipptycoded. Seems to work, and reviewing it it seems
+/// This function is mostly jippitycoded. Seems to work, and reviewing it it seems
 /// safe.
 fn extract_sni(clienthello: &[u8]) -> Result<Option<String>> {
     // Handshake header: type(1)=1, len(3)
@@ -1116,6 +1226,7 @@ fn acl_action(acl: &Acl, peer: &std::net::Ipv6Addr) -> protos::AclAction {
 async fn route_and_connect(
     id: usize,
     mut stream: tokio::net::TcpStream,
+    initial_bytes: Vec<u8>,
     config: &Config,
 ) -> Result<RoutedConnection> {
     let peer = match stream.peer_addr()?.ip() {
@@ -1123,7 +1234,7 @@ async fn route_and_connect(
         std::net::IpAddr::V6(v6) => v6,
     };
     // Read and validate a full TLS ClientHello.
-    let (bytes, clienthello) = read_tls_clienthello(&mut stream).await?;
+    let (bytes, clienthello) = read_tls_clienthello(&mut stream, initial_bytes).await?;
     match clienthello {
         Ok(clienthello) => {
             debug!("id={id} ClientHello len={} bytes", clienthello.len());
@@ -1189,8 +1300,13 @@ async fn route_and_connect(
 /// Handle connection.
 ///
 /// Called under `max_lifetime_ms` timeout.
-async fn handle_conn(id: usize, stream: tokio::net::TcpStream, config: &Config) -> Result<()> {
-    let fut = route_and_connect(id, stream, config);
+async fn handle_conn(
+    id: usize,
+    stream: tokio::net::TcpStream,
+    initial_bytes: Vec<u8>,
+    config: &Config,
+) -> Result<()> {
+    let fut = route_and_connect(id, stream, initial_bytes, config);
     let routed = if let Some(timeout) = config.handshake_timeout {
         match tokio::time::timeout(timeout, fut).await {
             Ok(r) => r?,
@@ -1214,21 +1330,61 @@ async fn handle_conn(id: usize, stream: tokio::net::TcpStream, config: &Config) 
     }
 }
 
+/// An accepted connection. If it came from a TCP listener we expect the initial
+/// bytes to be empty.
+struct AcceptedConnection {
+    stream: tokio::net::TcpStream,
+    peer: String,
+    initial_bytes: Vec<u8>,
+}
+
+enum IngressListener {
+    Tcp(tokio::net::TcpListener),
+    UnixDatagram(UnixDatagram),
+}
+
+impl IngressListener {
+    async fn accept(&self) -> Result<AcceptedConnection> {
+        match self {
+            Self::Tcp(listener) => {
+                let (stream, peer) = listener.accept().await.context("accept TCP")?;
+                Ok(AcceptedConnection {
+                    stream,
+                    peer: peer.to_string(),
+                    initial_bytes: Vec::new(),
+                })
+            }
+            Self::UnixDatagram(sock) => {
+                let (stream, initial_bytes) = recv_fd_over_uds(sock).await?;
+                let peer = stream
+                    .peer_addr()
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|e| format!("<unknown: {e}>"));
+                Ok(AcceptedConnection {
+                    stream,
+                    peer,
+                    initial_bytes,
+                })
+            }
+        }
+    }
+}
+
 async fn mainloop(
     mut config: Arc<Config>,
     config_filename: &str,
-    listener: tokio::net::TcpListener,
+    listener: IngressListener,
     allow_keylogging: bool,
 ) -> Result<()> {
     let mut id = 0;
     let mut hups = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
         .expect("Registering SIGHUP");
     loop {
-        let (stream, peer) = tokio::select! {
+        let conn = tokio::select! {
             r = listener.accept() => match r {
                 Ok(r) => r,
                 Err(e) => {
-                    error!("accept() failed: {e}");
+                    error!("accept failed: {e:#}");
                     continue;
                 }
             },
@@ -1245,6 +1401,11 @@ async fn mainloop(
             }
         };
         ACCEPTS.inc();
+        let AcceptedConnection {
+            stream,
+            peer,
+            initial_bytes,
+        } = conn;
         debug!("id={id} fd={} Accepted {}", stream.as_raw_fd(), peer);
         let config = config.clone();
         tokio::spawn(async move {
@@ -1252,7 +1413,7 @@ async fn mainloop(
             // TODO: why is only the first span span actually used?
             // let id_span = tracing::info_span!("id", "{id}");
             async move {
-                let fut = handle_conn(id, stream, &config);
+                let fut = handle_conn(id, stream, initial_bytes, &config);
                 let res = if let Some(timeout) = config.max_lifetime {
                     match tokio::time::timeout(timeout, fut).await {
                         Ok(o) => o,
@@ -1296,10 +1457,22 @@ async fn main() -> Result<()> {
         env!("GIT_VERSION"),
         env!("RUSTC_VERSION")
     );
-    let listener = tokio::net::TcpListener::bind(&opt.listen)
-        .await
-        .context(format!("listening to {}", opt.listen))?;
-    debug!("Listening on {}", listener.local_addr()?);
+    let listener = if let Some(path) = opt.listen_unix_datagram.as_ref() {
+        let listener = UnixDatagram::bind(path)
+            .with_context(|| format!("listening on unix datagram {}", path.display()))?;
+        debug!("Listening on unix datagram {}", path.display());
+        IngressListener::UnixDatagram(listener)
+    } else {
+        let listen = opt
+            .listen
+            .unwrap_or_else(|| "[::]:443".parse().expect("valid default listen address"));
+        let listener = tokio::net::TcpListener::bind(&listen)
+            .await
+            .context(format!("listening to {listen}"))?;
+        debug!("Listening on {}", listener.local_addr()?);
+        set_nodelay(listener.as_raw_fd())?;
+        IngressListener::Tcp(listener)
+    };
     privs::sni_drop(
         &opt.restrict_dirs
             .iter()
@@ -1307,7 +1480,6 @@ async fn main() -> Result<()> {
             .collect::<Vec<_>>(),
         opt.allow_keylogging,
     )?;
-    set_nodelay(listener.as_raw_fd())?;
     // Config.
     let config = load_config(&opt.config, opt.allow_keylogging)
         .context(format!("Loading config {:?}", opt.config))?;
@@ -1434,7 +1606,7 @@ handshake_timeout_ms: 1234
                     sockfile.display()
                 ))?;
                 let _main = tokio::task::spawn(async move {
-                    mainloop(Arc::new(config), "", listener, false).await
+                    mainloop(Arc::new(config), "", IngressListener::Tcp(listener), false).await
                 });
 
                 let (done_tx1, mut done_rx_bar) = tokio::sync::mpsc::channel::<()>(1);
@@ -1517,6 +1689,112 @@ handshake_timeout_ms: 1234
     }
 
     #[tokio::test]
+    async fn unix_datagram_listener_can_receive_passed_fd_and_route_sni() -> Result<()> {
+        let tmp_dir = tempfile::TempDir::new()?;
+        let handoff_sockfile = tmp_dir.path().join("handoff.sock");
+        let handoff_listener = tokio::net::UnixDatagram::bind(&handoff_sockfile)?;
+
+        let frontend_listener =
+            tokio::net::TcpListener::bind("[::1]:0".parse::<SocketAddr>()?).await?;
+        let frontend_port = frontend_listener.local_addr()?.port();
+
+        let routed_backend =
+            tokio::net::TcpListener::bind("[::1]:0".parse::<SocketAddr>()?).await?;
+        let routed_backend_port = routed_backend.local_addr()?.port();
+
+        let frontend_config = make_config(&format!(
+            r#"
+        max_lifetime_ms: {}
+        default: <
+            backend: <
+                pass: <
+                    path: "{}"
+                >
+            >
+        >
+        "#,
+            MAX_TEST_CONNECTION_TIME.as_millis(),
+            handoff_sockfile.display()
+        ))?;
+        let backend_config = make_config(&format!(
+            r#"
+        max_lifetime_ms: {}
+        rules: <
+            regex: "socket"
+            backend: <
+                proxy: <
+                    addr: "[::1]:{routed_backend_port}"
+                >
+            >
+        >
+        default: <
+            backend: <
+                null: <>
+            >
+        >
+        "#,
+            MAX_TEST_CONNECTION_TIME.as_millis()
+        ))?;
+
+        let _frontend = tokio::task::spawn(async move {
+            mainloop(
+                Arc::new(frontend_config),
+                "",
+                IngressListener::Tcp(frontend_listener),
+                false,
+            )
+            .await
+        });
+        let _backend = tokio::task::spawn(async move {
+            mainloop(
+                Arc::new(backend_config),
+                "",
+                IngressListener::UnixDatagram(handoff_listener),
+                false,
+            )
+            .await
+        });
+
+        let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let client = async {
+            let _status = tokio::process::Command::new("curl")
+                .arg("-S")
+                .arg("--no-progress-meter")
+                .arg("--max-time")
+                .arg("2")
+                .arg("--connect-to")
+                .arg(format!("socket:443:[::1]:{frontend_port}"))
+                .arg("https://socket/")
+                .spawn()?
+                .wait()
+                .await?;
+            drop(done_tx);
+            Ok::<(), anyhow::Error>(())
+        };
+        let backend = async {
+            let (mut stream, _) = tokio::select! {
+                r = routed_backend.accept() => r.context("accepting routed backend"),
+                _ = done_rx.recv() => Err(anyhow!("routed backend was not hit")),
+            }?;
+            let mut got = [0u8; 5];
+            stream
+                .read_exact(&mut got)
+                .await
+                .context("reading routed ClientHello record header")?;
+            if got[0] != 22 {
+                return Err(anyhow!("backend got unexpected first TLS byte: {got:?}"));
+            }
+            Ok::<(), anyhow::Error>(())
+        };
+
+        tokio::time::timeout(MAX_TEST_CONNECTION_TIME, async {
+            tokio::try_join!(client, backend)
+        })
+        .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn handshake_timeout_closes_idle_preroute_client() -> Result<()> {
         let listener = tokio::net::TcpListener::bind("[::1]:0".parse::<SocketAddr>()?).await?;
         let listener_port = listener.local_addr()?.port();
@@ -1532,10 +1810,9 @@ handshake_timeout_ms: 1234
         "#,
             MAX_TEST_CONNECTION_TIME.as_millis()
         ))?;
-        let _main =
-            tokio::task::spawn(
-                async move { mainloop(Arc::new(config), "", listener, false).await },
-            );
+        let _main = tokio::task::spawn(async move {
+            mainloop(Arc::new(config), "", IngressListener::Tcp(listener), false).await
+        });
 
         let mut stream = tokio::net::TcpStream::connect(format!("[::1]:{listener_port}")).await?;
         let mut buf = [0u8; 1];
@@ -1600,10 +1877,9 @@ default: <
         "#,
             MAX_TEST_CONNECTION_TIME.as_millis()
         ))?;
-        let _main =
-            tokio::task::spawn(
-                async move { mainloop(Arc::new(config), "", listener, false).await },
-            );
+        let _main = tokio::task::spawn(async move {
+            mainloop(Arc::new(config), "", IngressListener::Tcp(listener), false).await
+        });
 
         let backend = tokio::spawn(async move {
             let (mut stream, _) = backend.accept().await?;
