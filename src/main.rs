@@ -167,6 +167,10 @@ fn set_nodelay(fd: libc::c_int) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn parse_octal(s: &str) -> Result<u32, std::num::ParseIntError> {
+    u32::from_str_radix(s, 8)
+}
+
 /// SNI router.
 ///
 /// <https://github.com/ThomasHabets/sni-router>
@@ -178,12 +182,26 @@ struct Opt {
     verbose: String,
 
     /// TCP address to listen to. Defaults to [::]:443.
-    #[arg(long, short, conflicts_with = "listen_unix_datagram")]
+    #[arg(long, short)]
     listen: Option<std::net::SocketAddr>,
 
     /// Unix datagram socket path to receive SCM_RIGHTS handoffs on instead of TCP accepts.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", conflicts_with = "listen")]
     listen_unix_datagram: Option<std::path::PathBuf>,
+
+    /// Unix datagram socket path to receive SCM_RIGHTS handoffs on instead of TCP accepts.
+    #[arg(long, value_name = "GROUP", conflicts_with = "listen")]
+    unix_group: Option<String>,
+
+    /// Unix datagram socket path to receive SCM_RIGHTS handoffs on instead of TCP accepts.
+    #[arg(
+        long,
+        value_parser=parse_octal,
+        value_name = "MODE",
+        default_value = "660",
+        conflicts_with = "listen"
+    )]
+    unix_perms: u32,
 
     /// Restrict router to only be able to read under this directory.
     #[arg(long, default_value = "/")]
@@ -1458,8 +1476,51 @@ async fn main() -> Result<()> {
         env!("RUSTC_VERSION")
     );
     let listener = if let Some(path) = opt.listen_unix_datagram.as_ref() {
+        // Remove existing socket if and only if it's a socket.
+        //
+        // If it exists but is not a socket, then it could be a symlink. In
+        // that case sure, go ahead. It won't work unless the symlink is
+        // dangling, but traversing symlinks to delete the destination
+        // sounds dangerous. The user is on their own if they want to do
+        // that.
+        if let Ok(meta) = std::fs::symlink_metadata(path) {
+            use std::os::unix::fs::FileTypeExt; // for is_socket()
+            if meta.file_type().is_socket()
+                && let Err(e) = std::fs::remove_file(path)
+            {
+                warn!("Failed to remove old socket {}: {e}", path.display());
+            }
+        }
+
+        if opt.unix_perms & !0o777 != 0 {
+            return Err(anyhow!("Unix perms must only set ugo (0777 maximum)"));
+        }
         let listener = UnixDatagram::bind(path)
             .with_context(|| format!("listening on unix datagram {}", path.display()))?;
+
+        // Set permissions.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::symlink_metadata(path)?.permissions();
+            perms.set_mode(opt.unix_perms);
+            std::fs::set_permissions(path, perms.clone())
+                .context(format!("chmod {perms:?} on {}", path.display()))?;
+        }
+
+        // Set group.
+        if let Some(group_name) = &opt.unix_group {
+            let group = nix::unistd::Group::from_name(group_name)?
+                .ok_or_else(|| anyhow::anyhow!("group not found: {group_name}"))?;
+            nix::unistd::chown(
+                path,
+                None,
+                Some(nix::unistd::Gid::from_raw(group.gid.as_raw())),
+            )
+            .context(format!(
+                "chown {} with group {group_name} ({group:?})",
+                path.display()
+            ))?;
+        }
         debug!("Listening on unix datagram {}", path.display());
         IngressListener::UnixDatagram(listener)
     } else {
