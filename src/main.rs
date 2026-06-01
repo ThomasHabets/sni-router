@@ -50,6 +50,7 @@ use clap::Parser;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixDatagram;
+use tracing::Instrument;
 use tracing::{debug, error, info, trace, warn};
 
 mod protos {
@@ -1119,7 +1120,7 @@ async fn route_and_connect(
                             }
                             protos::AclAction::Continue => continue,
                             protos::AclAction::Drop => {
-                                return Err(anyhow!("{peer:?} rejected by ACL to {}", rule.re));
+                                return Err(anyhow!("rejected by ACL to {sni} (rule {})", rule.re));
                             }
                             protos::AclAction::Accept => {}
                         }
@@ -1225,19 +1226,26 @@ async fn mainloop(
         debug!("id={id} fd={} Accepted {}", stream.as_raw_fd(), peer);
         let config = config.clone();
         tokio::spawn(async move {
-            let fut = handle_conn(id, stream, &config);
-            let res = if let Some(timeout) = config.max_lifetime {
-                match tokio::time::timeout(timeout, fut).await {
-                    Ok(o) => o,
-                    Err(e) => Err(anyhow!("global connection timeout: {e}")),
+            let peer_span = tracing::error_span!("peer", "{peer}");
+            // TODO: why is only the first span span actually used?
+            // let id_span = tracing::info_span!("id", "{id}");
+            async move {
+                let fut = handle_conn(id, stream, &config);
+                let res = if let Some(timeout) = config.max_lifetime {
+                    match tokio::time::timeout(timeout, fut).await {
+                        Ok(o) => o,
+                        Err(e) => Err(anyhow!("global connection timeout: {e}")),
+                    }
+                } else {
+                    fut.await
+                };
+                if let Err(e) = res {
+                    warn!("id={id} Handling connection: {e:#}");
                 }
-            } else {
-                fut.await
-            };
-            if let Err(e) = res {
-                warn!("id={id} Handling connection to {peer}: {e:#}");
+                debug!("id={id} Done");
             }
-            debug!("id={id} Done");
+            .instrument(peer_span)
+            .await
         });
         id += 1;
     }
@@ -1259,6 +1267,7 @@ async fn main() -> Result<()> {
         //.with_env_filter(format!("sni_router={}", opt.verbose))
         .with_env_filter(&opt.verbose)
         .with_writer(std::io::stderr)
+        .event_format(tracing_subscriber::fmt::format().with_ansi(false))
         .init();
     info!(
         "SNI Router {} built with {}",
