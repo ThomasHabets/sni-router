@@ -27,4 +27,7 @@ fn main() {
         let version = String::from_utf8(out.stdout).unwrap();
         println!("cargo:rustc-env=RUSTC_VERSION={version}");
     }
+
+    let profile = std::env::var("PROFILE").unwrap();
+    println!("cargo:rustc-env=BUILD_PROFILE={profile}");
 }

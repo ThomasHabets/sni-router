@@ -111,7 +111,7 @@ fn push_metrics(job: &str, url: &str) -> Result<()> {
 
     prometheus::push_metrics(
         job,
-        grouping, // grouping labels
+        grouping,
         url,
         REGISTRY.gather(),
         None, // optional basic auth
@@ -1478,15 +1478,11 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .event_format(tracing_subscriber::fmt::format().with_ansi(false))
         .init();
-    let profile = if cfg!(debug_assertions) {
-        "DEBUG"
-    } else {
-        "RELEASE"
-    };
     info!(
-        "SNI Router {} built with {} in mode {profile}",
+        "SNI Router {} built with {} in mode {}",
         env!("GIT_VERSION"),
-        env!("RUSTC_VERSION")
+        env!("RUSTC_VERSION"),
+        env!("BUILD_PROFILE"),
     );
     let listener = if let Some(path) = opt.listen_unix_datagram.as_ref() {
         // Remove existing socket if and only if it's a socket.
