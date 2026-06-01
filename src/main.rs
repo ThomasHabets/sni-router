@@ -925,6 +925,22 @@ async fn tls_handshake(
         let still_handshaking = tls.is_handshaking();
         if !still_handshaking {
             HANDSHAKE_LATENCY.observe(handshake_start.elapsed().as_millis() as f64);
+
+            debug!(
+                "Handshake done using version {}, handshake kind {}, cipher {}, kx {}",
+                tls.protocol_version()
+                    .map(|k| format!("{k:?}"))
+                    .unwrap_or("<unknown>".to_string()),
+                tls.handshake_kind()
+                    .map(|k| format!("{k:?}"))
+                    .unwrap_or("<unknown>".to_string()),
+                tls.negotiated_cipher_suite()
+                    .map(|k| format!("{k:?}"))
+                    .unwrap_or("<unknown>".to_string()),
+                tls.negotiated_key_exchange_group()
+                    .map(|k| format!("{k:?}"))
+                    .unwrap_or("<unknown>".to_string()),
+            );
             let plain_n = io.plaintext_bytes_to_read();
             let mut buf = vec![0u8; plain_n];
             let n = tls
