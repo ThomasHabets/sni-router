@@ -83,6 +83,16 @@ static SNI: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
     metric
 });
 
+static FRONTEND_HANDSHAKES: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
+    let metric = prometheus::IntCounterVec::new(
+        prometheus::Opts::new("frontend_handshakes", "Frontend TLS handshakes performed."),
+        &["sni", "version", "handshake_kind", "cipher", "key_exchange"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(metric.clone())).unwrap();
+    metric
+});
+
 static HANDSHAKE_LATENCY: LazyLock<prometheus::Histogram> = LazyLock::new(|| {
     use prometheus::HistogramOpts;
     let metric = Histogram::with_opts(
@@ -926,21 +936,42 @@ async fn tls_handshake(
         if !still_handshaking {
             HANDSHAKE_LATENCY.observe(handshake_start.elapsed().as_millis() as f64);
 
-            debug!(
-                "Handshake done using version {}, handshake kind {}, cipher {}, kx {}",
-                tls.protocol_version()
+            {
+                let hs_sni = tls.server_name().unwrap_or("<missing>");
+                let hs_version = tls
+                    .protocol_version()
                     .map(|k| format!("{k:?}"))
-                    .unwrap_or("<unknown>".to_string()),
-                tls.handshake_kind()
+                    .unwrap_or("<unknown>".to_string());
+                let hs_kind = tls
+                    .handshake_kind()
                     .map(|k| format!("{k:?}"))
-                    .unwrap_or("<unknown>".to_string()),
-                tls.negotiated_cipher_suite()
+                    .unwrap_or("<unknown>".to_string());
+                let hs_cipher = tls
+                    .negotiated_cipher_suite()
                     .map(|k| format!("{k:?}"))
-                    .unwrap_or("<unknown>".to_string()),
-                tls.negotiated_key_exchange_group()
-                    .map(|k| format!("{k:?}"))
-                    .unwrap_or("<unknown>".to_string()),
-            );
+                    .unwrap_or("<unknown>".to_string());
+                let (hs_key_exchange_full, hs_key_exchange) = tls
+                    .negotiated_key_exchange_group()
+                    .map(|k| {
+                        (
+                            format!("{k:?}"),
+                            format!("{}", k.name().as_str().unwrap_or("<bad group>")),
+                        )
+                    })
+                    .unwrap_or(("<unknown>".to_string(), "<unknown>".to_string()));
+                FRONTEND_HANDSHAKES
+                    .with_label_values(&[
+                        hs_sni,
+                        &hs_version,
+                        &hs_kind,
+                        &hs_cipher,
+                        &hs_key_exchange,
+                    ])
+                    .inc();
+                debug!(
+                    "Handshake done using version {hs_version}, handshake kind {hs_kind}, cipher {hs_cipher}, kx {hs_key_exchange_full}"
+                );
+            }
             let plain_n = io.plaintext_bytes_to_read();
             let mut buf = vec![0u8; plain_n];
             let n = tls
