@@ -19,10 +19,10 @@ jobs:
     - name: Install clippy
       run: rustup component add --toolchain nightly clippy
     - name: Cargo install
-      run: cargo install cargo-deny tickbox
+      run: cargo install --locked cargo-deny tickbox
     - name: apt-get update
       run: sudo apt-get update
-    - name: Install stuff
+    - name: apt install
       run: sudo apt-get install protobuf-compiler libprotobuf-dev
     - name: Build
       run: cargo build --verbose
