@@ -60,6 +60,7 @@ message Rule {
 }
 
 message Backend {
+        // TODO: rename this "FrontendTls"?
         message Tls {
                 string cert_file = 1;
                 string key_file = 2;
@@ -67,11 +68,28 @@ message Backend {
                 // If set, require clients to present a cert signed by this CA.
                 string mtls_ca = 3;
         }
+        message BackendTls {
+                string cert_file = 1;
+                string key_file = 2;
+
+                // Yolo. Don't care about name matching or expiry.
+                bool insecure = 3;
+
+                // If set, the server must be from this CA.
+                // string ca_file = 4;
+                //
+                // SNI to use. Defaults to the backend address.
+                // string sni = 5;
+
+        }
         message Null {
         }
         message Proxy {
                 string addr = 1;
                 bool proxy_header = 2;
+
+                // If missing, speak plain HTTP to backend.
+                BackendTls backend_tls = 3;
         }
         message Pass {
                 string path = 1;

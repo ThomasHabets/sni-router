@@ -23,9 +23,11 @@ prost = "0.14.3"
 prost-reflect = { version = "0.16.3", features = ["text-format"] }
 regex = "1.12.3"
 rustls = { version = "0.23.40", features = ["prefer-post-quantum"] }
+rustls-native-certs = "0.8.4"
 serde = { version = "1.0.228", features = ["derive"] }
 stderrlog = "0.6.0"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "net", "macros", "time", "signal"] }
+tokio-rustls = "0.26.4"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 

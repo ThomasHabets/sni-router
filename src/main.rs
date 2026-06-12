@@ -246,6 +246,80 @@ fn load_root_store(path: &str) -> Result<rustls::RootCertStore> {
     Ok(roots)
 }
 
+#[derive(Debug)]
+struct YoloVerifier {}
+
+impl rustls::client::danger::ServerCertVerifier for YoloVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA384,
+            rustls::SignatureScheme::RSA_PKCS1_SHA512,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::ED25519,
+        ]
+    }
+}
+
+fn load_backend_tls(
+    pb: &protos::backend::BackendTls,
+    allow_keylogging: bool,
+) -> Result<Arc<rustls::ClientConfig>> {
+    let mut cfg = if pb.insecure {
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(YoloVerifier {}))
+            .with_no_client_auth()
+    } else {
+        let mut roots = rustls::RootCertStore::empty();
+        let certs = rustls_native_certs::load_native_certs();
+        roots.add_parsable_certificates(certs.certs);
+
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth()
+    };
+    cfg.enable_secret_extraction = true;
+    if allow_keylogging {
+        cfg.key_log = Arc::new(rustls::KeyLogFile::new());
+    }
+    // TODO: I guess we should forward ALPN protocols sometimes?
+    Ok(Arc::new(cfg))
+}
+
 /// Load TLS data from files as specified in the proto part.
 #[allow(clippy::unnecessary_wraps)]
 fn load_tls(
@@ -344,12 +418,24 @@ fn load_backend(
             }
             Backend::Null
         }
-        protos::backend::BackendType::Proxy(p) => Backend::Proxy {
-            addr: p.addr.clone(),
-            proxy_header: p.proxy_header,
-            frontend_tls: load_tls(frontend_tls, allow_keylogging)?,
-            sorry,
-        },
+        protos::backend::BackendType::Proxy(p) => {
+            if p.proxy_header && p.backend_tls.is_some() {
+                return Err(anyhow!(
+                    "backend TLS is currently not supported combined with proxy protocol"
+                ));
+            }
+            Backend::Proxy {
+                addr: p.addr.clone(),
+                proxy_header: p.proxy_header,
+                frontend_tls: load_tls(frontend_tls, allow_keylogging)?,
+                backend_tls: p
+                    .backend_tls
+                    .as_ref()
+                    .map(|pb| load_backend_tls(&pb, allow_keylogging))
+                    .transpose()?,
+                sorry,
+            }
+        }
         protos::backend::BackendType::Pass(p) => Backend::Pass {
             path: p.path.clone().into(),
             frontend_tls: load_tls(frontend_tls, allow_keylogging)?,
@@ -824,6 +910,7 @@ enum Backend {
         addr: String,
         proxy_header: bool,
         frontend_tls: Option<Arc<rustls::ServerConfig>>,
+        backend_tls: Option<Arc<rustls::ClientConfig>>,
         sorry: Option<Box<Backend>>,
     },
 }
@@ -1045,11 +1132,30 @@ async fn tls_handshake(
     }
 }
 
+fn split_host_port(addr: &str) -> Option<(&str, u16)> {
+    let (host, port) = addr.rsplit_once(':')?;
+    let port = port.parse().ok()?;
+    if host.starts_with('[') && host.ends_with(']') {
+        // Raw IPv6.
+        Some((&host[1..host.len() - 1], port))
+    } else if host.contains(':') {
+        // Invalid.
+        None
+    } else {
+        // Name or IPv4.
+        Some((host, port))
+    }
+}
+
 /// Do a connect for proxied connections.
 ///
 /// This is called under handshake timeout, and failure will fall back to sorry
 /// server.
-async fn connect_for_proxy(id: usize, addr: &str) -> Result<tokio::net::TcpStream> {
+async fn connect_for_proxy(
+    id: usize,
+    addr: &str,
+    backend_tls: Option<Arc<rustls::ClientConfig>>,
+) -> Result<tokio::net::TcpStream> {
     let addrs = addr
         .to_socket_addrs()
         .context(format!("parsing backend address {addr}"))?;
@@ -1066,9 +1172,45 @@ async fn connect_for_proxy(id: usize, addr: &str) -> Result<tokio::net::TcpStrea
             }
         }
     }
-    conn.ok_or(anyhow!(
-        "failed to connect to any backend with address {addr}"
-    ))
+
+    let Some(conn) = conn else {
+        return Err(anyhow!(
+            "failed to connect to any backend with address {addr}"
+        ));
+    };
+    let Some(tls_config) = backend_tls else {
+        trace!("Backend is plaintext. No TLS handshake");
+        return Ok(conn);
+    };
+
+    trace!("Handshaking with backend");
+    let connector = tokio_rustls::TlsConnector::from(tls_config);
+
+    // The server name cannot be a hostport. It has to be something that looks
+    // like a server name or address without port.
+    let (host, _port) = split_host_port(addr).unwrap_or_else(|| {
+        debug!("Failed to split backend hostport {addr}");
+        ("placeholder", 0)
+    });
+    let sni = rustls::pki_types::ServerName::try_from(host.to_string())?;
+
+    // TLS handshake.
+    let conn = ktls::CorkStream::new(conn);
+    let tls = connector.connect(sni, conn).await?;
+
+    let t = ktls::config_ktls_client(tls).await?;
+    let (data, conn) = t.into_raw();
+    debug_assert!(data.is_none());
+    if let Some(data) = data {
+        // TODO: For non-HTTPS protocols there's nothing wrong with that. So we
+        // should handle it.
+        return Err(anyhow!(
+            "backend sent {} bytes of payload before client sent anything",
+            data.len()
+        ));
+    }
+    trace!("kTLS with backend set up");
+    Ok(conn)
 }
 
 /// After fully connected, and handshake timeout no longer relevant, run the
@@ -1194,7 +1336,7 @@ fn connect_or_handoff_backend<'a>(
                     .connect(path)
                     .with_context(|| format!("connect to {:?}", path.display()))
                 {
-                    info!("Primary backend connect failure: {e}");
+                    info!("Primary backend ({}) connect failure: {e}", path.display());
                     if let Some(s) = sorry {
                         return connect_or_handoff_backend(id, stream, bytes, s).await;
                     }
@@ -1229,12 +1371,13 @@ fn connect_or_handoff_backend<'a>(
                 addr,
                 proxy_header,
                 frontend_tls,
+                backend_tls,
                 sorry,
             } => {
-                let conn = match connect_for_proxy(id, addr).await {
+                let conn = match connect_for_proxy(id, addr, backend_tls.clone()).await {
                     Ok(c) => c,
                     Err(e) => {
-                        info!("Primary backend connect failure: {e}");
+                        info!("Primary backend ({addr}) connect failure: {e}");
                         return match sorry {
                             None => Err(e),
                             Some(s) => connect_or_handoff_backend(id, stream, bytes, s).await,
