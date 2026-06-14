@@ -126,3 +126,43 @@ sni-router --listen-unix-datagram pass.sock --config backend.conf
 That lets one SNI Router use `pass: < path: "pass.sock" >` with another SNI
 Router as the backend. The receiving router uses the passed TCP fd plus the
 initial bytes from the datagram and then applies its normal SNI routing rules.
+
+## HTTP/3 / QUIC routing
+
+The `sni-router-h3` binary listens on UDP and routes QUIC v1 / HTTP/3 traffic.
+It decrypts QUIC Initial packets using the public Initial secrets, extracts SNI
+from the TLS ClientHello in CRYPTO frames, then forwards the original UDP
+datagrams unchanged. After routing is established, packets are routed by learned
+QUIC connection IDs where possible. If an endpoint uses zero-length connection
+IDs, client packets fall back to the client UDP address and backend replies use
+the per-connection backend UDP socket that received them.
+
+Because post-handshake QUIC frames are encrypted, the router cannot learn
+connection IDs advertised later with `NEW_CONNECTION_ID`. Backends should keep
+using connection IDs visible during the Initial exchange for traffic that must
+pass through this router.
+
+It uses the same asciiproto config format, but only `null` and `proxy` backends
+are supported. For `sni-router-h3`, `proxy.addr` is interpreted as a UDP backend
+address and TCP-only options such as `proxy_header`, `pass`, `frontend_tls`, and
+`sorry` are rejected.
+
+```
+sni-router-h3 --listen [::]:443 --config h3.conf
+```
+
+```
+rules: <
+        regex: "(www[.]|)example[.]com"
+        backend: <
+                proxy: <
+                        addr: "[::1]:8443"
+                >
+        >
+>
+default: <
+        backend: <
+                null: <>
+        >
+>
+```

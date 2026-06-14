@@ -82,6 +82,58 @@ pub(crate) fn sni_drop(dirs: &[&std::path::Path], write_keylogfile: bool) -> Res
     Ok(())
 }
 
+/// Drop privs suitable for the UDP HTTP/3 router.
+///
+/// Landlock currently only supports TCP network rights, so this confines file
+/// system access and signal delivery, and drops Linux capabilities. The UDP
+/// socket must be bound before calling this.
+///
+/// # Errors
+///
+/// If dropping privs fails.
+#[allow(dead_code)]
+pub(crate) fn h3_drop(dirs: &[&std::path::Path]) -> Result<()> {
+    use landlock::{
+        ABI, Access, AccessFs, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus, Scope,
+        path_beneath_rules,
+    };
+
+    drop_caps()?;
+
+    let abi = ABI::V6;
+    let status = Ruleset::default()
+        .handle_access(AccessFs::from_all(abi))?
+        .create()?
+        .set_no_new_privs(true)
+        .add_rules(path_beneath_rules(dirs, AccessFs::from_read(abi)))?
+        .restrict_self()?;
+    match status.ruleset {
+        RulesetStatus::FullyEnforced => {
+            info!("Landlock enabled and fully enforced for filesystem");
+        }
+        other => {
+            return Err(anyhow!(
+                "Landlock status not fully enforced for filesystem: {other:?}"
+            ));
+        }
+    }
+
+    let status = Ruleset::default()
+        .scope(Scope::Signal)?
+        .create()?
+        .restrict_self()?;
+    match status.ruleset {
+        RulesetStatus::FullyEnforced => {
+            info!("Landlock enabled and fully enforced for signal");
+        }
+        other => warn!(
+            "Landlock status not fully enforced for signal (probably kernel <6.12): {other:?}"
+        ),
+    }
+
+    Ok(())
+}
+
 /// Drop all capabilities, if present.
 fn drop_caps() -> Result<()> {
     trace!("Dropping caps");
