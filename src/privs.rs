@@ -26,7 +26,7 @@ pub(crate) fn sni_drop(dirs: &[&std::path::Path], write_keylogfile: bool) -> Res
             .handle_access(AccessFs::from_all(abi))?
             .handle_access(AccessNet::BindTcp)?
             .create()?
-            .set_no_new_privs(true)
+            .no_new_privs(true)
             .add_rules(path_beneath_rules(dirs, AccessFs::from_read(abi)))?;
         if let Ok(k) = std::env::var("SSLKEYLOGFILE")
             && write_keylogfile
@@ -104,7 +104,7 @@ pub(crate) fn h3_drop(dirs: &[&std::path::Path]) -> Result<()> {
     let status = Ruleset::default()
         .handle_access(AccessFs::from_all(abi))?
         .create()?
-        .set_no_new_privs(true)
+        .no_new_privs(true)
         .add_rules(path_beneath_rules(dirs, AccessFs::from_read(abi)))?
         .restrict_self()?;
     match status.ruleset {
