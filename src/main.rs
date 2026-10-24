@@ -403,7 +403,7 @@ fn load_backend(
     let sorry = sorry
         .map(|s| {
             load_backend(
-                s.backend_type.as_ref().unwrap(),
+                s.backend_type.as_ref().context("empty sorry backend")?,
                 s.frontend_tls.as_ref(),
                 None,
                 allow_keylogging,
@@ -1802,6 +1802,13 @@ handshake_timeout_ms: 1234
             Some(tokio::time::Duration::from_millis(1234))
         );
         Ok(())
+    }
+
+    #[test]
+    fn config_rejects_empty_sorry_backend() {
+        let config =
+            make_config(r#"default: < backend: < proxy: < addr: "localhost:443" > sorry: <> > >"#);
+        assert!(config.is_err(), "unexpected config: {config:?}");
     }
 
     #[tokio::test]
