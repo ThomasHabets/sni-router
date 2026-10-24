@@ -775,7 +775,10 @@ impl CryptoReassembly {
         if data.is_empty() {
             return;
         }
-        self.fragments.insert(offset, data);
+        let old = self.fragments.get(&offset);
+        if old.is_none_or(|v| v.len() < data.len()) {
+            self.fragments.insert(offset, data);
+        }
     }
 
     fn contiguous(&self) -> Vec<u8> {
@@ -1618,6 +1621,18 @@ default: <
             extract_tls_sni(&hello)?,
             Some("www.example.com".to_string())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn shorter_crypto_retransmission_preserves_clienthello() -> Result<()> {
+        let hello = minimal_clienthello_sni("www.example.com");
+        let split = hello.len() / 2;
+        let mut crypto = CryptoReassembly::default();
+        crypto.insert(0, hello[..split].to_vec());
+        crypto.insert(0, hello[..split / 2].to_vec());
+        crypto.insert(u64::try_from(split)?, hello[split..].to_vec());
+        assert_eq!(crypto.clienthello()?, Some(hello));
         Ok(())
     }
 
