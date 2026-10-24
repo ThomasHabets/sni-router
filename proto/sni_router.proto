@@ -13,6 +13,7 @@ enum AclAction {
         ACCEPT = 2;
 
         // Reject the connection from this rule, but continue to the next Rule.
+        // In the default Rule there is no next Rule, so drop the connection.
         CONTINUE = 3;
 }
 

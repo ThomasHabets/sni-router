@@ -930,7 +930,11 @@ impl Router {
             }
         }
         Ok(Route {
-            backend: self.config.default.backend.clone(),
+            backend: match acl_action(&self.config.default.acl, &peer) {
+                protos::AclAction::Accept => self.config.default.backend.clone(),
+                protos::AclAction::Unspecified => bail!("unspecified default ACL action"),
+                protos::AclAction::Drop | protos::AclAction::Continue => Backend::Null,
+            },
             timeout: min_timeout(self.config.max_lifetime, self.config.default.timeout),
             sni,
         })
@@ -1612,6 +1616,42 @@ default: <
 "#,
         );
         assert!(config.is_err(), "unexpected config: {config:?}");
+    }
+
+    #[test]
+    fn default_acl_controls_fallback_routes() -> Result<()> {
+        for (peer, source) in [
+            ("127.0.0.1:12345", "127.0.0.0/8"),
+            ("[::ffff:127.0.0.1]:12345", "127.0.0.0/8"),
+            ("[::1]:12345", "::1/128"),
+        ] {
+            for (default_action, rule_action, allowed) in [
+                ("DROP", None, false),
+                ("CONTINUE", None, false),
+                ("UNSPECIFIED", None, false),
+                ("ACCEPT", None, true),
+                ("DROP", Some("ACCEPT"), true),
+                ("ACCEPT", Some("DROP"), false),
+            ] {
+                let rules = rule_action.map_or_else(String::new, |action| {
+                    format!("rules: < source: {source:?} action: {action} >")
+                });
+                let config = make_config(&format!(
+                    "default: < acl: < default_action: {default_action} {rules} >
+                     backend: < proxy: < addr: \"127.0.0.1:443\" > > >"
+                ))?;
+                let router = Router::new(Arc::new(config), Duration::from_secs(60));
+                for sni in [None, Some("unmatched.example.com".to_string())] {
+                    let route = router.route_for_sni(peer.parse()?, sni);
+                    let forwarded = route.is_ok_and(|r| matches!(r.backend, Backend::Udp { .. }));
+                    assert_eq!(
+                        forwarded, allowed,
+                        "peer={peer} default={default_action} rule={rule_action:?}"
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]

@@ -1499,6 +1499,13 @@ async fn route_and_connect(
             warn!("id={id} Using default backend because no clienthello: {e}");
         }
     }
+    match acl_action(&config.default.acl, &peer) {
+        protos::AclAction::Accept => {}
+        protos::AclAction::Unspecified => bail!("unspecified default ACL action"),
+        protos::AclAction::Drop | protos::AclAction::Continue => {
+            bail!("rejected by default ACL");
+        }
+    }
     Ok(RoutedConnection {
         sni: None,
         backend: connect_or_handoff_backend_with_timeout(
@@ -1809,6 +1816,72 @@ handshake_timeout_ms: 1234
         let config =
             make_config(r#"default: < backend: < proxy: < addr: "localhost:443" > sorry: <> > >"#);
         assert!(config.is_err(), "unexpected config: {config:?}");
+    }
+
+    #[tokio::test]
+    async fn default_acl_controls_fallback_connections() -> Result<()> {
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let tls_config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()?
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        let mut hellos = vec![vec![23, 3, 3, 0, 0]];
+        for enable_sni in [true, false] {
+            let mut tls_config = tls_config.clone();
+            tls_config.enable_sni = enable_sni;
+            let mut client = rustls::ClientConnection::new(
+                Arc::new(tls_config),
+                "unmatched.example.com".try_into()?,
+            )?;
+            let mut hello = Vec::new();
+            client.write_tls(&mut hello)?;
+            hellos.push(hello);
+        }
+        for (listen, source) in [("127.0.0.1:0", "127.0.0.0/8"), ("[::1]:0", "::1/128")] {
+            let listener = tokio::net::TcpListener::bind(listen).await?;
+            let backend = tokio::net::TcpListener::bind(listen).await?;
+            for (default_action, rule_action, allowed) in [
+                ("DROP", None, false),
+                ("CONTINUE", None, false),
+                ("UNSPECIFIED", None, false),
+                ("ACCEPT", None, true),
+                ("DROP", Some("ACCEPT"), true),
+                ("ACCEPT", Some("DROP"), false),
+            ] {
+                let rules = rule_action.map_or_else(String::new, |action| {
+                    format!("rules: < source: {source:?} action: {action} >")
+                });
+                let config = make_config(&format!(
+                    "default: < acl: < default_action: {default_action} {rules} >
+                     backend: < proxy: < addr: \"{}\" > > >",
+                    backend.local_addr()?
+                ))?;
+                for hello in &hellos {
+                    let _client = tokio::net::TcpStream::connect(listener.local_addr()?).await?;
+                    let (stream, _) = listener.accept().await?;
+                    let result = route_and_connect(0, stream, hello.clone(), &config).await;
+                    assert_eq!(
+                        result.is_ok(),
+                        allowed,
+                        "listen={listen} default={default_action} rule={rule_action:?}"
+                    );
+                    if allowed {
+                        backend.accept().await?;
+                    } else {
+                        assert!(
+                            tokio::time::timeout(
+                                tokio::time::Duration::from_millis(10),
+                                backend.accept()
+                            )
+                            .await
+                            .is_err(),
+                            "denied client reached the backend"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     #[tokio::test]
