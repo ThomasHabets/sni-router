@@ -33,7 +33,6 @@
 // Disable overly pedantic pedantic-level clippy lints.
 #![allow(clippy::similar_names)]
 
-use std::net::ToSocketAddrs;
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -1160,8 +1159,8 @@ async fn connect_for_proxy(
     addr: &str,
     backend_tls: Option<Arc<rustls::ClientConfig>>,
 ) -> Result<tokio::net::TcpStream> {
-    let addrs = addr
-        .to_socket_addrs()
+    let addrs = tokio::net::lookup_host(addr)
+        .await
         .context(format!("parsing backend address {addr}"))?;
     let mut conn = None;
     for addr in addrs {
