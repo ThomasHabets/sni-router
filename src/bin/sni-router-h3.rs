@@ -1260,8 +1260,10 @@ impl Router {
                 for cid in conn.cids {
                     self.cid_routes.remove(&cid);
                 }
-                self.client_routes
-                    .remove(&normalize_socket_addr(conn.client_addr));
+                let client = normalize_socket_addr(conn.client_addr);
+                if self.client_routes.get(&client) == Some(&conn_id) {
+                    self.client_routes.remove(&client);
+                }
                 conn.backend_task.abort();
             }
         }
@@ -1867,6 +1869,40 @@ default: <
             tokio::time::timeout(Duration::from_secs(1), backend_receiver.recv_from(&mut buf))
                 .await??;
         assert_eq!(&buf[..n], packet);
+        Ok(())
+    }
+    #[tokio::test]
+    async fn cleanup_preserves_newer_connection_from_same_client() -> Result<()> {
+        let backend = UdpSocket::bind("127.0.0.1:0").await?;
+        let backend_addr = backend.local_addr()?;
+        let config = make_config("default: < backend: < null: <> > >")?;
+        let mut router = Router::new(Arc::new(config), Duration::from_secs(60));
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let peer: SocketAddr = "127.0.0.1:40001".parse()?;
+        for dcid in [b"old-cid1".to_vec(), b"new-cid2".to_vec()] {
+            router
+                .establish_and_flush(
+                    PendingConnection::new(peer, dcid, Instant::now()),
+                    Route {
+                        backend: Backend::Udp { addr: backend_addr },
+                        timeout: None,
+                        sni: None,
+                    },
+                    &tx,
+                )
+                .await?;
+        }
+        let current_id = *router.client_routes.get(&peer).unwrap();
+        let old_id = *router
+            .connections
+            .keys()
+            .find(|id| **id != current_id)
+            .unwrap();
+        router.connections.get_mut(&old_id).unwrap().last_seen =
+            Instant::now() - Duration::from_secs(61);
+        router.cleanup();
+        assert!(router.connections.contains_key(&current_id));
+        assert_eq!(router.client_routes.get(&peer), Some(&current_id));
         Ok(())
     }
 }
