@@ -506,7 +506,11 @@ fn load_rule(rule: &protos::Rule, is_default: bool, allow_keylogging: bool) -> R
             .ok_or(anyhow!("No regex supplied in rule"))?
     };
     Ok(Rule {
-        re: regex::Regex::new(re)?,
+        re: if is_default {
+            regex::Regex::new(re)?
+        } else {
+            compile_full_match(re)?
+        },
         acl: rule.acl.as_ref().map_or(
             Ok(Acl {
                 rules: vec![],
@@ -1418,12 +1422,16 @@ async fn connect_or_handoff_backend_with_timeout(
     }
 }
 
-/// Regex fullmatch wrapper.
-fn is_full_match(re: &regex::Regex, text: &str) -> bool {
-    match re.find(text) {
-        Some(m) => m.start() == 0 && m.end() == text.len(),
-        None => false,
-    }
+/// Compile a routing regex that must match the entire hostname.
+fn compile_full_match(pattern: &str) -> Result<regex::Regex> {
+    // Validate before wrapping so the pattern cannot close the added group.
+    regex::Regex::new(pattern)?;
+    Ok(
+        regex::Regex::new(&format!(r"\A(?:{pattern})\z")).or_else(|_| {
+            // A trailing free-spacing comment can swallow the closing group.
+            regex::Regex::new(&format!("\\A(?:{pattern}\n)\\z"))
+        })?,
+    )
 }
 
 fn acl_action(acl: &Acl, peer: &std::net::Ipv6Addr) -> protos::AclAction {
@@ -1458,7 +1466,7 @@ async fn route_and_connect(
                 Some(sni) => {
                     debug!("id={id} SNI: {sni:?}");
                     for rule in &config.rules {
-                        if !is_full_match(&rule.re, &sni) {
+                        if !rule.re.is_match(&sni) {
                             continue;
                         }
                         trace!("id={id} SNI {sni} matched rule {rule:?}");
@@ -2249,6 +2257,47 @@ default: <
         tokio::time::timeout(MAX_TEST_CONNECTION_TIME, stream.read_to_end(&mut got)).await??;
         backend.await??;
         assert_eq!(got, b"ok");
+        Ok(())
+    }
+
+    #[test]
+    fn routing_regex_matches_entire_hostname() -> Result<()> {
+        assert!(compile_full_match("example[.]com)|(?:evil").is_err());
+        for (pattern, hostname, expected) in [
+            ("example[.]com|example[.]com[.]au", "example.com.au", true),
+            ("example[.]com|example[.]com[.]au", "example.com", true),
+            (
+                "example[.]com|example[.]com[.]au",
+                "prefix.example.com",
+                false,
+            ),
+            (
+                "example[.]com|example[.]com[.]au",
+                "example.com.au.evil",
+                false,
+            ),
+            (".*?", "example.com", true),
+            ("(?i)example[.]com", "EXAMPLE.COM", true),
+            ("(?m)example[.]com", "example.com\nother", false),
+            ("(?x)example [.] com # comment", "example.com", true),
+            ("", "example.com", false),
+            ("", "", true),
+        ] {
+            let rule = protos::Rule {
+                regex: Some(pattern.into()),
+                backend: Some(protos::Backend {
+                    backend_type: Some(protos::backend::BackendType::Null(Default::default())),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let rule = load_rule(&rule, false, false)?;
+            assert_eq!(
+                rule.re.is_match(hostname),
+                expected,
+                "pattern={pattern:?} hostname={hostname:?}"
+            );
+        }
         Ok(())
     }
 }
