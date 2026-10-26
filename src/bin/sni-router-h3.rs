@@ -42,6 +42,9 @@ const PROTO_DESCRIPTOR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descri
 
 const QUIC_VERSION_1: u32 = 0x0000_0001;
 const QUIC_PACKET_TYPE_INITIAL: u8 = 0;
+const QUIC_PACKET_TYPE_ZERO_RTT: u8 = 1;
+const QUIC_PACKET_TYPE_HANDSHAKE: u8 = 2;
+const QUIC_PACKET_TYPE_RETRY: u8 = 3;
 const QUIC_V1_INITIAL_SALT: &[u8] = &[
     0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad,
     0xcc, 0xbb, 0x7f, 0x0a,
@@ -653,8 +656,15 @@ fn packet_nonce(iv: &[u8; 12], packet_number: u64) -> aead::Nonce {
 }
 
 fn decrypt_initial_packet(packet: &[u8]) -> Result<DecryptedInitial> {
+    decrypt_initial_packet_with_dcid(packet, None)
+}
+
+fn decrypt_initial_packet_with_dcid(
+    packet: &[u8],
+    key_dcid: Option<&[u8]>,
+) -> Result<DecryptedInitial> {
     let header = parse_initial_header(packet)?;
-    let keys = initial_keys(&header.cids.dcid)?;
+    let keys = initial_keys(key_dcid.unwrap_or(&header.cids.dcid))?;
 
     let sample_offset = header.packet_number_offset + 4;
     if header.packet_end < sample_offset + aead::quic::AES_128.sample_len() {
@@ -883,11 +893,19 @@ struct Connection {
     backend_writer: Option<SendQueue>,
     backend_task: tokio::task::JoinHandle<()>,
     client_addr: SocketAddr,
+    initial_key_dcid: Vec<u8>,
     cids: HashSet<Vec<u8>>,
     created: Instant,
     last_seen: Instant,
     deadline: Option<Instant>,
     sni: Option<String>,
+}
+
+impl Connection {
+    fn expired(&self, now: Instant, idle_timeout: Duration) -> bool {
+        now.saturating_duration_since(self.last_seen) >= idle_timeout
+            || self.deadline.is_some_and(|deadline| now >= deadline)
+    }
 }
 
 struct Router {
@@ -897,7 +915,7 @@ struct Router {
     next_connection_id: usize,
     connections: HashMap<usize, Connection>,
     cid_routes: CidRoutes,
-    client_routes: HashMap<SocketAddr, usize>,
+    client_routes: HashMap<SocketAddr, HashSet<usize>>,
     pending: HashMap<(SocketAddr, Vec<u8>), PendingConnection>,
 }
 
@@ -965,6 +983,10 @@ impl Router {
         packet: &[u8],
         backend_events: &tokio::sync::mpsc::Sender<BackendDatagram>,
     ) -> Result<()> {
+        if packet.is_empty() {
+            debug!("dropping empty QUIC datagram from {peer}");
+            return Ok(());
+        }
         let (long, conn_id) = match self.packet_connection_id(packet) {
             Ok(route) => route,
             Err(e) => {
@@ -973,16 +995,6 @@ impl Router {
             }
         };
         trace!("Got packet with CIDS {long:?}");
-
-        let conn_id = conn_id.or_else(|| {
-            long.is_none()
-                .then(|| {
-                    self.client_routes
-                        .get(&normalize_socket_addr(peer))
-                        .copied()
-                })
-                .flatten()
-        });
 
         let Some(conn_id) = conn_id else {
             return self
@@ -1005,6 +1017,44 @@ impl Router {
         }
     }
 
+    fn peer_connection_id(&self, peer: SocketAddr, now: Instant) -> Option<usize> {
+        let ids = self.client_routes.get(&normalize_socket_addr(peer))?;
+        let mut live = ids.iter().copied().filter(|id| {
+            self.connections
+                .get(id)
+                .is_some_and(|conn| !conn.expired(now, self.idle_timeout))
+        });
+        let id = live.next()?;
+        if live.next().is_some() {
+            debug!("dropping datagram from ambiguous peer {peer}");
+            return None;
+        }
+        Some(id)
+    }
+
+    async fn forward_by_peer_affinity(
+        &mut self,
+        peer: SocketAddr,
+        packet: &[u8],
+        long: Option<LongPacketCids>,
+        validate_initial: bool,
+    ) -> Result<()> {
+        let Some(id) = self.peer_connection_id(peer, Instant::now()) else {
+            debug!("no unique live peer affinity for {peer}");
+            return Ok(());
+        };
+        if validate_initial {
+            let conn = self.connections.get(&id).expect("live peer connection");
+            if let Err(e) = decrypt_initial_packet_with_dcid(packet, Some(&conn.initial_key_dcid)) {
+                debug!("dropping Initial from {peer} that does not match connection id={id}: {e}");
+                return Ok(());
+            }
+        }
+        debug!("forwarding datagram by peer affinity peer={peer} connection id={id}");
+        self.forward_established_client_datagram(id, peer, packet, long)
+            .await
+    }
+
     fn packet_connection_id(
         &self,
         packet: &[u8],
@@ -1025,12 +1075,23 @@ impl Router {
         packet: Packet,
         long: Option<LongPacketCids>,
     ) -> Result<()> {
+        let retry_key_dcid = long
+            .as_ref()
+            .filter(|long| {
+                long.version == QUIC_VERSION_1
+                    && long.packet_type == QUIC_PACKET_TYPE_RETRY
+                    && !long.scid.is_empty()
+            })
+            .map(|long| long.scid.clone());
         let new_cid = long.and_then(|long| (!long.scid.is_empty()).then_some(long.scid));
         let client_addr = {
             let Some(conn) = self.connections.get_mut(&conn_id) else {
                 return Ok(());
             };
             conn.last_seen = Instant::now();
+            if let Some(dcid) = retry_key_dcid {
+                conn.initial_key_dcid = dcid;
+            }
             conn.client_addr
         };
         if let Some(cid) = new_cid {
@@ -1072,9 +1133,20 @@ impl Router {
         backend_events: &tokio::sync::mpsc::Sender<BackendDatagram>,
     ) -> Result<()> {
         let Some(long) = long else {
-            debug!("dropping short-header client datagram from {peer} with unknown connection ID");
-            return Ok(());
+            return self
+                .forward_by_peer_affinity(peer, packet, None, false)
+                .await;
         };
+        if long.version == QUIC_VERSION_1
+            && matches!(
+                long.packet_type,
+                QUIC_PACKET_TYPE_HANDSHAKE | QUIC_PACKET_TYPE_ZERO_RTT
+            )
+        {
+            return self
+                .forward_by_peer_affinity(peer, packet, Some(long), false)
+                .await;
+        }
         if long.version != QUIC_VERSION_1 || long.packet_type != QUIC_PACKET_TYPE_INITIAL {
             debug!(
                 "dropping unrouted long-header client datagram from {peer}: version={:#x} type={}",
@@ -1086,8 +1158,10 @@ impl Router {
         let decrypted = match decrypt_initial_packet(packet) {
             Ok(decrypted) => decrypted,
             Err(e) => {
-                debug!("dropping undecryptable QUIC Initial from {peer}: {e}");
-                return Ok(());
+                debug!("Initial from {peer} did not decrypt as a new connection: {e}");
+                return self
+                    .forward_by_peer_affinity(peer, packet, Some(long), true)
+                    .await;
             }
         };
         let crypto_frames = match read_crypto_frames(&decrypted.payload) {
@@ -1144,22 +1218,14 @@ impl Router {
         long: Option<LongPacketCids>,
     ) -> Result<()> {
         let new_cid = long.and_then(|long| (!long.scid.is_empty()).then_some(long.scid));
-        let old_client_addr = {
+        {
             let Some(conn) = self.connections.get_mut(&conn_id) else {
                 return Ok(());
             };
-            let old_client_addr = conn.client_addr;
             conn.client_addr = peer;
             conn.last_seen = Instant::now();
             send_or_queue(&conn.backend_socket, &mut conn.backend_writer, packet, None)?;
-            old_client_addr
-        };
-        let old_client_key = normalize_socket_addr(old_client_addr);
-        let new_client_key = normalize_socket_addr(peer);
-        if old_client_key != new_client_key {
-            self.client_routes.remove(&old_client_key);
         }
-        self.client_routes.insert(new_client_key, conn_id);
         if let Some(cid) = new_cid {
             self.add_cid_route(conn_id, cid);
         }
@@ -1211,6 +1277,7 @@ impl Router {
                 backend_writer: None,
                 backend_task,
                 client_addr: pending.client_addr,
+                initial_key_dcid: pending.initial_dcid,
                 cids: cids.clone(),
                 created: now,
                 last_seen: now,
@@ -1222,7 +1289,9 @@ impl Router {
             self.cid_routes.insert(cid, conn_id);
         }
         self.client_routes
-            .insert(normalize_socket_addr(pending.client_addr), conn_id);
+            .entry(normalize_socket_addr(pending.client_addr))
+            .or_default()
+            .insert(conn_id);
         info!(
             "routing QUIC connection id={conn_id} peer={} sni={:?} backend={addr} backend_socket={backend_socket_addr}",
             pending.client_addr, route.sni
@@ -1261,11 +1330,7 @@ impl Router {
         let expired: Vec<_> = self
             .connections
             .iter()
-            .filter_map(|(conn_id, conn)| {
-                let idle = now.duration_since(conn.last_seen) >= self.idle_timeout;
-                let lifetime = conn.deadline.is_some_and(|deadline| now >= deadline);
-                (idle || lifetime).then_some(*conn_id)
-            })
+            .filter_map(|(conn_id, conn)| conn.expired(now, self.idle_timeout).then_some(*conn_id))
             .collect();
         for conn_id in expired {
             if let Some(conn) = self.connections.remove(&conn_id) {
@@ -1279,8 +1344,11 @@ impl Router {
                     self.cid_routes.remove(&cid);
                 }
                 let client = normalize_socket_addr(conn.client_addr);
-                if self.client_routes.get(&client) == Some(&conn_id) {
-                    self.client_routes.remove(&client);
+                if let Some(ids) = self.client_routes.get_mut(&client) {
+                    ids.remove(&conn_id);
+                    if ids.is_empty() {
+                        self.client_routes.remove(&client);
+                    }
                 }
                 conn.backend_task.abort();
             }
@@ -1627,13 +1695,23 @@ mod tests {
     }
 
     fn protected_initial_packet(dcid: &[u8], scid: &[u8], payload: &[u8]) -> Vec<u8> {
-        let key_bytes = initial_key_bytes(dcid).unwrap();
+        protected_initial_packet_with_key_dcid(dcid, scid, payload, dcid, 0)
+    }
+
+    fn protected_initial_packet_with_key_dcid(
+        dcid: &[u8],
+        scid: &[u8],
+        payload: &[u8],
+        key_dcid: &[u8],
+        packet_number: u32,
+    ) -> Vec<u8> {
+        let key_bytes = initial_key_bytes(key_dcid).unwrap();
         let open = aead::LessSafeKey::new(
             aead::UnboundKey::new(&aead::AES_128_GCM, &key_bytes.key).unwrap(),
         );
         let hp = aead::quic::HeaderProtectionKey::new(&aead::quic::AES_128, &key_bytes.hp).unwrap();
-        let packet_number = 0u64;
-        let packet_number_bytes = [0u8, 0, 0, 0];
+        let packet_number_bytes = packet_number.to_be_bytes();
+        let packet_number = u64::from(packet_number);
 
         let mut ciphertext = payload.to_vec();
         let mut header = Vec::new();
@@ -1667,6 +1745,250 @@ mod tests {
             packet[packet_number_offset + i] ^= mask[i + 1];
         }
         packet
+    }
+
+    async fn receive_backend_packet(socket: &UdpSocket) -> Result<Vec<u8>> {
+        let mut packet = vec![0; MAX_DATAGRAM_SIZE];
+        let len = tokio::time::timeout(Duration::from_secs(2), socket.recv(&mut packet)).await??;
+        packet.truncate(len);
+        Ok(packet)
+    }
+
+    fn assert_backend_empty(socket: &UdpSocket) {
+        let result = socket.try_recv(&mut [0; 2048]);
+        assert!(matches!(result, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+    }
+
+    async fn peer_fixture(peer: SocketAddr) -> Result<(Router, UdpSocket)> {
+        let backend = UdpSocket::bind("127.0.0.1:0").await?;
+        let config = make_config(&format!(
+            "default: < backend: < proxy: < addr: \"{}\" > > >",
+            backend.local_addr()?
+        ))
+        .await?;
+        let mut router = Router::new(Arc::new(config), Duration::from_secs(60));
+        let hello = minimal_clienthello_sni("good.example");
+        let initial = protected_initial_packet(b"original", b"", &crypto_frame(0, &hello));
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        router.handle_datagram(peer, &initial, &tx).await?;
+        assert_eq!(receive_backend_packet(&backend).await?, initial);
+        Ok((router, backend))
+    }
+
+    fn opaque_long_packet(dcid: &[u8], packet_type: u8) -> Vec<u8> {
+        let mut packet = long_packet_with_cids(dcid, b"");
+        packet[0] = 0xc0 | (packet_type << 4);
+        packet.push(17); // packet number plus opaque authentication tag
+        packet.extend_from_slice(&[0; 17]);
+        packet
+    }
+
+    #[tokio::test]
+    async fn peer_affinity_forwards_unknown_cids_for_ipv4_and_ipv6() -> Result<()> {
+        for (established, incoming) in [
+            ("127.0.0.1:12345", "127.0.0.1:12345"),
+            ("127.0.0.1:12345", "[::ffff:127.0.0.1]:12345"),
+            ("[::1]:12345", "[::1]:12345"),
+        ] {
+            let (mut router, backend) = peer_fixture(established.parse()?).await?;
+            let (tx, _rx) = tokio::sync::mpsc::channel(1);
+            for packet in [
+                opaque_long_packet(b"rotated1", QUIC_PACKET_TYPE_HANDSHAKE),
+                opaque_long_packet(b"rotated2", QUIC_PACKET_TYPE_ZERO_RTT),
+                [b"\x40".as_slice(), b"rotated3", b"payload"].concat(),
+            ] {
+                router
+                    .handle_datagram(incoming.parse()?, &packet, &tx)
+                    .await?;
+                assert_eq!(receive_backend_packet(&backend).await?, packet);
+            }
+            for cid in [b"rotated1", b"rotated2", b"rotated3"] {
+                assert_eq!(router.cid_routes.get(cid), None);
+            }
+            let last_seen = router.connections[&0].last_seen;
+            let packet = opaque_long_packet(b"unknown1", QUIC_PACKET_TYPE_HANDSHAKE);
+            router
+                .handle_datagram("127.0.0.1:54321".parse()?, &packet, &tx)
+                .await?;
+            assert_backend_empty(&backend);
+            assert_eq!(router.connections[&0].last_seen, last_seen);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rotated_initial_validates_old_keys_and_forwards_coalesced_datagram() -> Result<()> {
+        let peer = "127.0.0.1:12345".parse()?;
+        let (mut router, backend) = peer_fixture(peer).await?;
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let initial =
+            protected_initial_packet_with_key_dcid(b"rotated1", b"", &[0x01], b"original", 1);
+        assert!(decrypt_initial_packet(&initial).is_err());
+        assert!(decrypt_initial_packet_with_dcid(&initial, Some(b"original")).is_ok());
+        let mut coalesced = initial.clone();
+        coalesced.extend_from_slice(&opaque_long_packet(b"rotated1", QUIC_PACKET_TYPE_HANDSHAKE));
+        coalesced.extend_from_slice(b"\x40rotated1application");
+        router.handle_datagram(peer, &coalesced, &tx).await?;
+        assert_eq!(receive_backend_packet(&backend).await?, coalesced);
+        assert_eq!(router.cid_routes.get(b"rotated1"), None);
+        let last_seen = router.connections[&0].last_seen;
+
+        let mut corrupt = initial.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        let wrong_key =
+            protected_initial_packet_with_key_dcid(b"rotated2", b"", &[0x01], b"wrongkey", 1);
+        let mut unsupported_version = opaque_long_packet(b"unknown1", QUIC_PACKET_TYPE_HANDSHAKE);
+        unsupported_version[4] = 2;
+        for packet in [
+            vec![],
+            corrupt,
+            wrong_key,
+            initial[..initial.len() - 1].to_vec(),
+            vec![0xc0, 0, 0, 0, 1, 16, 42],
+            unsupported_version,
+            opaque_long_packet(b"unknown2", QUIC_PACKET_TYPE_RETRY),
+        ] {
+            router.handle_datagram(peer, &packet, &tx).await?;
+            assert_backend_empty(&backend);
+            assert_eq!(router.connections[&0].last_seen, last_seen);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fresh_initial_keeps_sni_acl_routing_and_ambiguous_peers_drop() -> Result<()> {
+        let first = UdpSocket::bind("127.0.0.1:0").await?;
+        let second = UdpSocket::bind("127.0.0.1:0").await?;
+        let config = make_config(&format!(
+            r#"
+            rules: < regex: "first[.]example" backend: < proxy: < addr: "{}" > > >
+            rules: < regex: "second[.]example" backend: < proxy: < addr: "{}" > > >
+            rules: < regex: "blocked[.]example" acl: < default_action: DROP >
+                     backend: < proxy: < addr: "{}" > > >
+            default: < backend: < null: <> > >
+        "#,
+            first.local_addr()?,
+            second.local_addr()?,
+            second.local_addr()?
+        ))
+        .await?;
+        let mut router = Router::new(Arc::new(config), Duration::from_secs(60));
+        let peer = "127.0.0.1:12345".parse()?;
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let hello = minimal_clienthello_sni("first.example");
+        let initial = protected_initial_packet(b"initial1", b"", &crypto_frame(0, &hello));
+        router.handle_datagram(peer, &initial, &tx).await?;
+        assert_eq!(receive_backend_packet(&first).await?, initial);
+
+        // A fresh, fragmented ClientHello on the same peer must await its own SNI.
+        let hello = minimal_clienthello_sni("second.example");
+        let split = hello.len() / 2;
+        let a = protected_initial_packet(b"initial2", b"", &crypto_frame(0, &hello[..split]));
+        router.handle_datagram(peer, &a, &tx).await?;
+        assert_backend_empty(&first);
+        assert_backend_empty(&second);
+        let b = protected_initial_packet_with_key_dcid(
+            b"initial2",
+            b"",
+            &crypto_frame(u64::try_from(split)?, &hello[split..]),
+            b"initial2",
+            1,
+        );
+        router.handle_datagram(peer, &b, &tx).await?;
+        assert_eq!(receive_backend_packet(&second).await?, a);
+        assert_eq!(receive_backend_packet(&second).await?, b);
+        assert_eq!(router.peer_connection_id(peer, Instant::now()), None);
+
+        let hello = minimal_clienthello_sni("blocked.example");
+        let denied = protected_initial_packet(b"initial3", b"", &crypto_frame(0, &hello));
+        router.handle_datagram(peer, &denied, &tx).await?;
+        assert_eq!(router.connections.len(), 2);
+        let seen: Vec<_> = (0..2).map(|id| router.connections[&id].last_seen).collect();
+        for packet in [
+            opaque_long_packet(b"rotated1", QUIC_PACKET_TYPE_HANDSHAKE),
+            opaque_long_packet(b"rotated2", QUIC_PACKET_TYPE_ZERO_RTT),
+            b"\x40rotated3payload".to_vec(),
+            protected_initial_packet_with_key_dcid(b"rotated4", b"", &[0x01], b"initial1", 1),
+        ] {
+            router.handle_datagram(peer, &packet, &tx).await?;
+        }
+        assert_backend_empty(&first);
+        assert_backend_empty(&second);
+        for (id, last_seen) in seen.into_iter().enumerate() {
+            assert_eq!(router.connections[&id].last_seen, last_seen);
+        }
+        for (cid, backend) in [(b"initial1", &first), (b"initial2", &second)] {
+            let packet = [b"\x40".as_slice(), cid, b"payload"].concat();
+            router.handle_datagram(peer, &packet, &tx).await?;
+            assert_eq!(receive_backend_packet(backend).await?, packet);
+            assert_eq!(router.peer_connection_id(peer, Instant::now()), None);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn affinity_excludes_expired_routes_and_peer_reuse_is_safe() -> Result<()> {
+        let peer = "127.0.0.1:12345".parse()?;
+        let (mut router, backend) = peer_fixture(peer).await?;
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        router.connections.get_mut(&0).unwrap().deadline = Some(Instant::now());
+        assert_eq!(router.peer_connection_id(peer, Instant::now()), None);
+        let packet = opaque_long_packet(b"unknown1", QUIC_PACKET_TYPE_HANDSHAKE);
+        let last_seen = router.connections[&0].last_seen;
+        router.handle_datagram(peer, &packet, &tx).await?;
+        assert_backend_empty(&backend);
+        assert_eq!(router.connections[&0].last_seen, last_seen);
+
+        let hello = minimal_clienthello_sni("good.example");
+        let initial = protected_initial_packet(b"newstart", b"", &crypto_frame(0, &hello));
+        router.handle_datagram(peer, &initial, &tx).await?;
+        assert_eq!(receive_backend_packet(&backend).await?, initial);
+        assert_eq!(router.peer_connection_id(peer, Instant::now()), Some(1));
+        router.cleanup();
+        assert_eq!(router.client_routes[&peer], HashSet::from([1]));
+        router.handle_datagram(peer, &packet, &tx).await?;
+        assert_eq!(receive_backend_packet(&backend).await?, packet);
+        router.connections.get_mut(&1).unwrap().last_seen =
+            Instant::now() - Duration::from_secs(61);
+        let last_seen = router.connections[&1].last_seen;
+        router.handle_datagram(peer, &packet, &tx).await?;
+        assert_backend_empty(&backend);
+        assert_eq!(router.connections[&1].last_seen, last_seen);
+        router.cleanup();
+        assert!(!router.client_routes.contains_key(&peer));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn backend_retry_updates_initial_key_dcid_for_affinity() -> Result<()> {
+        let client = UdpSocket::bind("127.0.0.1:0").await?;
+        let peer = client.local_addr()?;
+        let (mut router, backend) = peer_fixture(peer).await?;
+        let mut sockets = ProxySockets::new("127.0.0.1:0".parse()?)?;
+        let mut retry = long_packet_with_cids(b"", b"retrycid");
+        retry[0] = 0xf0;
+        retry.extend_from_slice(b"token-and-tag-placeholder");
+        router
+            .handle_backend_datagram(
+                &mut sockets,
+                BackendDatagram {
+                    conn_id: 0,
+                    packet: router.packet_pool.copy_packet(&retry),
+                },
+            )
+            .await?;
+        assert_eq!(receive_backend_packet(&client).await?, retry);
+        assert_eq!(router.connections[&0].initial_key_dcid, b"retrycid");
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let packet =
+            protected_initial_packet_with_key_dcid(b"rotated1", b"", &[0x01], b"retrycid", 1);
+        router.handle_datagram(peer, &packet, &tx).await?;
+        assert_eq!(receive_backend_packet(&backend).await?, packet);
+        let old_keys =
+            protected_initial_packet_with_key_dcid(b"rotated2", b"", &[0x01], b"original", 1);
+        router.handle_datagram(peer, &old_keys, &tx).await?;
+        assert_backend_empty(&backend);
+        Ok(())
     }
 
     #[tokio::test]
@@ -1917,6 +2239,7 @@ default: <
                 backend_writer: None,
                 backend_task: tokio::spawn(async {}),
                 client_addr,
+                initial_key_dcid: vec![],
                 cids: HashSet::from([client_cid.clone()]),
                 created: Instant::now(),
                 last_seen: Instant::now(),
@@ -1973,6 +2296,7 @@ default: <
                 backend_writer: None,
                 backend_task: tokio::spawn(async {}),
                 client_addr,
+                initial_key_dcid: vec![],
                 cids: HashSet::new(),
                 created: Instant::now(),
                 last_seen: Instant::now(),
@@ -2025,7 +2349,7 @@ default: <
         let conn_id = 11;
         router
             .client_routes
-            .insert(normalize_socket_addr(client_addr), conn_id);
+            .insert(normalize_socket_addr(client_addr), HashSet::from([conn_id]));
         router.connections.insert(
             conn_id,
             Connection {
@@ -2033,6 +2357,7 @@ default: <
                 backend_writer: None,
                 backend_task: tokio::spawn(async {}),
                 client_addr,
+                initial_key_dcid: vec![],
                 cids: HashSet::new(),
                 created: Instant::now(),
                 last_seen: Instant::now(),
@@ -2075,7 +2400,7 @@ default: <
                 )
                 .await?;
         }
-        let current_id = *router.client_routes.get(&peer).unwrap();
+        let current_id = router.next_connection_id - 1;
         let old_id = *router
             .connections
             .keys()
@@ -2085,7 +2410,10 @@ default: <
             Instant::now() - Duration::from_secs(61);
         router.cleanup();
         assert!(router.connections.contains_key(&current_id));
-        assert_eq!(router.client_routes.get(&peer), Some(&current_id));
+        assert_eq!(
+            router.client_routes.get(&peer),
+            Some(&HashSet::from([current_id]))
+        );
         Ok(())
     }
 

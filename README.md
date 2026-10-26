@@ -149,14 +149,22 @@ The `sni-router-h3` binary listens on UDP and routes QUIC v1 / HTTP/3 traffic.
 It decrypts QUIC Initial packets using the public Initial secrets, extracts SNI
 from the TLS ClientHello in CRYPTO frames, then forwards the original UDP
 datagrams unchanged. After routing is established, packets are routed by learned
-QUIC connection IDs where possible. If an endpoint uses zero-length connection
-IDs, client packets fall back to the client UDP address and backend replies use
-the per-connection backend UDP socket that received them.
+QUIC connection IDs where possible. For unknown or zero-length CIDs, peer
+affinity forwards traffic only when exactly one live connection matches the
+client IP address and UDP port. This includes Handshake and 0-RTT packets and
+coalesced datagrams beginning with an Initial that verifies with that
+connection's Initial keys. Backend replies use the per-connection backend UDP
+socket that received them.
 
-Because post-handshake QUIC frames are encrypted, the router cannot learn
-connection IDs advertised later with `NEW_CONNECTION_ID`. Backends should keep
-using connection IDs visible during the Initial exchange for traffic that must
-pass through this router.
+Fresh Initial packets still undergo ClientHello reassembly, SNI routing, and
+ACL evaluation, even when the client address and port already have a route.
+Multiple connections may share a client address and port, but ambiguous
+unknown-CID packets are dropped until only one live connection remains.
+
+CID changes advertised in encrypted `NEW_CONNECTION_ID` frames work through
+peer affinity while the client IP address and port remain stable. The router
+does not learn those CIDs from the encrypted frames; client migration or NAT
+rebinding to a different address or port remains unsupported.
 
 UDP forwarding uses nonblocking sends. Congested sockets have a bounded queue
 of up to 32 datagrams and 128 KiB. Excess datagrams are dropped so backpressure
