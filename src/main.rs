@@ -1683,9 +1683,13 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .event_format(tracing_subscriber::fmt::format().with_ansi(false))
         .init();
+    let version = if env!("GIT_VERSION").is_empty() {
+        env!("CARGO_PKG_VERSION")
+    } else {
+        &format!("{} ({})", env!("CARGO_PKG_VERSION"), env!("GIT_VERSION"))
+    };
     info!(
-        "SNI Router {} built with {} in mode {}",
-        env!("GIT_VERSION"),
+        "SNI Router {version} built with {} in mode {}",
         env!("RUSTC_VERSION"),
         env!("BUILD_PROFILE"),
     );
