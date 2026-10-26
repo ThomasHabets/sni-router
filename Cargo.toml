@@ -1,6 +1,7 @@
 [package]
 name = "sni-router"
 version = "0.2.5"
+default-run = "sni-router"
 edition = "2024"
 license = "MIT"
 authors = ["Thomas Habets <thomas@habets.se>"]

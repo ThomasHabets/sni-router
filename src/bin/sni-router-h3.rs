@@ -13,6 +13,8 @@ mod cid_routes;
 mod privs;
 #[path = "../resolver.rs"]
 mod resolver;
+#[path = "../version.rs"]
+mod version;
 
 use cid_routes::CidRoutes;
 #[path = "../h3_udp.rs"]
@@ -1436,11 +1438,7 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .event_format(tracing_subscriber::fmt::format().with_ansi(false))
         .init();
-    info!(
-        "HTTP/3 SNI Router {} built with {}",
-        env!("GIT_VERSION"),
-        env!("RUSTC_VERSION")
-    );
+    info!("HTTP/3 SNI Router {}", version::version_string());
 
     let sockets = ProxySockets::new(opt.listen)?;
     debug!("Listening on UDP {}", sockets.client_addr()?);
