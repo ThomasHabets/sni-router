@@ -15,6 +15,9 @@ mod privs;
 mod resolver;
 
 use cid_routes::CidRoutes;
+#[path = "../h3_udp.rs"]
+mod udp;
+use udp::{MAX_DATAGRAM_SIZE, Packet, PacketPool, SendQueue, send_or_queue};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6};
@@ -42,7 +45,6 @@ const QUIC_V1_INITIAL_SALT: &[u8] = &[
     0xcc, 0xbb, 0x7f, 0x0a,
 ];
 
-const MAX_DATAGRAM_SIZE: usize = 65_535;
 const MAX_PENDING_DATAGRAMS: usize = 32;
 const MAX_PENDING_BYTES: usize = 128 * 1024;
 
@@ -308,24 +310,9 @@ fn send_addr_for_socket(socket: &UdpSocket, addr: SocketAddr) -> Result<SocketAd
     }
 }
 
-async fn send_udp_on_socket(
-    socket: &UdpSocket,
-    packet: &[u8],
-    addr: SocketAddr,
-    description: &str,
-) -> Result<()> {
-    let send_addr = send_addr_for_socket(socket, addr)?;
-    socket.send_to(packet, send_addr).await.with_context(|| {
-        format!(
-            "{description}: sending {} byte datagram to {send_addr} (configured addr {addr})",
-            packet.len()
-        )
-    })?;
-    Ok(())
-}
-
 struct ProxySockets {
     client: Arc<UdpSocket>,
+    writer: Option<SendQueue>,
 }
 
 impl ProxySockets {
@@ -335,6 +322,7 @@ impl ProxySockets {
                 bind_udp_socket(client_listen, true)
                     .with_context(|| format!("listening on UDP {client_listen}"))?,
             ),
+            writer: None,
         })
     }
 
@@ -344,14 +332,15 @@ impl ProxySockets {
             .context("getting client UDP socket addr")
     }
 
-    async fn send_to_client(&self, packet: &[u8], addr: SocketAddr) -> Result<()> {
-        send_udp_on_socket(&self.client, packet, addr, "sending datagram to client").await
+    fn send_to_client(&mut self, packet: &[u8], addr: SocketAddr) -> Result<()> {
+        let addr = send_addr_for_socket(&self.client, addr)?;
+        send_or_queue(&self.client, &mut self.writer, packet, Some(addr))
     }
 }
 
 struct BackendDatagram {
     conn_id: usize,
-    packet: Vec<u8>,
+    packet: Packet,
 }
 
 fn acl_action(acl: &Acl, peer: &Ipv6Addr) -> protos::AclAction {
@@ -883,6 +872,7 @@ impl PendingConnection {
 
 struct Connection {
     backend_socket: Arc<UdpSocket>,
+    backend_writer: Option<SendQueue>,
     backend_task: tokio::task::JoinHandle<()>,
     client_addr: SocketAddr,
     cids: HashSet<Vec<u8>>,
@@ -894,6 +884,7 @@ struct Connection {
 
 struct Router {
     config: Arc<Config>,
+    packet_pool: Arc<PacketPool>,
     idle_timeout: Duration,
     next_connection_id: usize,
     connections: HashMap<usize, Connection>,
@@ -906,6 +897,7 @@ impl Router {
     fn new(config: Arc<Config>, idle_timeout: Duration) -> Self {
         Self {
             config,
+            packet_pool: Arc::new(PacketPool::default()),
             idle_timeout,
             next_connection_id: 0,
             connections: HashMap::new(),
@@ -962,10 +954,10 @@ impl Router {
     async fn handle_datagram(
         &mut self,
         peer: SocketAddr,
-        packet: Vec<u8>,
+        packet: &[u8],
         backend_events: &tokio::sync::mpsc::Sender<BackendDatagram>,
     ) -> Result<()> {
-        let (long, conn_id) = match self.packet_connection_id(&packet) {
+        let (long, conn_id) = match self.packet_connection_id(packet) {
             Ok(route) => route,
             Err(e) => {
                 debug!("dropping datagram with malformed QUIC header from {peer}: {e}");
@@ -1020,9 +1012,9 @@ impl Router {
 
     async fn forward_established_backend_datagram(
         &mut self,
-        sockets: &ProxySockets,
+        sockets: &mut ProxySockets,
         conn_id: usize,
-        packet: Vec<u8>,
+        packet: Packet,
         long: Option<LongPacketCids>,
     ) -> Result<()> {
         let new_cid = long.and_then(|long| (!long.scid.is_empty()).then_some(long.scid));
@@ -1036,14 +1028,14 @@ impl Router {
         if let Some(cid) = new_cid {
             self.add_cid_route(conn_id, cid);
         }
-        sockets.send_to_client(&packet, client_addr).await?;
+        sockets.send_to_client(&packet, client_addr)?;
         trace!("forwarded backend datagram for connection id={conn_id}");
         Ok(())
     }
 
     async fn handle_backend_datagram(
         &mut self,
-        sockets: &ProxySockets,
+        sockets: &mut ProxySockets,
         datagram: BackendDatagram,
     ) -> Result<()> {
         let long = match parse_long_packet_cids(&datagram.packet) {
@@ -1067,7 +1059,7 @@ impl Router {
     async fn handle_unrouted_client_datagram(
         &mut self,
         peer: SocketAddr,
-        packet: Vec<u8>,
+        packet: &[u8],
         long: Option<LongPacketCids>,
         backend_events: &tokio::sync::mpsc::Sender<BackendDatagram>,
     ) -> Result<()> {
@@ -1083,7 +1075,7 @@ impl Router {
             return Ok(());
         }
 
-        let decrypted = match decrypt_initial_packet(&packet) {
+        let decrypted = match decrypt_initial_packet(packet) {
             Ok(decrypted) => decrypted,
             Err(e) => {
                 debug!("dropping undecryptable QUIC Initial from {peer}: {e}");
@@ -1109,7 +1101,7 @@ impl Router {
             if !decrypted.scid.is_empty() {
                 pending.client_cids.insert(decrypted.scid);
             }
-            pending.push_datagram(packet)?;
+            pending.push_datagram(packet.to_vec())?;
             for (offset, data) in crypto_frames {
                 pending.crypto.insert(offset, data);
             }
@@ -1140,18 +1132,19 @@ impl Router {
         &mut self,
         conn_id: usize,
         peer: SocketAddr,
-        packet: Vec<u8>,
+        packet: &[u8],
         long: Option<LongPacketCids>,
     ) -> Result<()> {
         let new_cid = long.and_then(|long| (!long.scid.is_empty()).then_some(long.scid));
-        let (backend, old_client_addr) = {
+        let old_client_addr = {
             let Some(conn) = self.connections.get_mut(&conn_id) else {
                 return Ok(());
             };
             let old_client_addr = conn.client_addr;
             conn.client_addr = peer;
             conn.last_seen = Instant::now();
-            (conn.backend_socket.clone(), old_client_addr)
+            send_or_queue(&conn.backend_socket, &mut conn.backend_writer, packet, None)?;
+            old_client_addr
         };
         let old_client_key = normalize_socket_addr(old_client_addr);
         let new_client_key = normalize_socket_addr(peer);
@@ -1162,10 +1155,6 @@ impl Router {
         if let Some(cid) = new_cid {
             self.add_cid_route(conn_id, cid);
         }
-        backend
-            .send(&packet)
-            .await
-            .context("sending datagram to backend")?;
         Ok(())
     }
 
@@ -1192,8 +1181,12 @@ impl Router {
             .local_addr()
             .map(|addr| addr.to_string())
             .unwrap_or_else(|e| format!("<unknown: {e}>"));
-        let backend_task =
-            spawn_backend_reader(conn_id, backend_socket.clone(), backend_events.clone());
+        let backend_task = spawn_backend_reader(
+            conn_id,
+            backend_socket.clone(),
+            backend_events.clone(),
+            self.packet_pool.clone(),
+        );
         let mut cids = HashSet::new();
         if !pending.initial_dcid.is_empty() {
             cids.insert(pending.initial_dcid.clone());
@@ -1207,6 +1200,7 @@ impl Router {
             conn_id,
             Connection {
                 backend_socket: backend_socket.clone(),
+                backend_writer: None,
                 backend_task,
                 client_addr: pending.client_addr,
                 cids: cids.clone(),
@@ -1225,10 +1219,12 @@ impl Router {
             "routing QUIC connection id={conn_id} peer={} sni={:?} backend={addr} backend_socket={backend_socket_addr}",
             pending.client_addr, route.sni
         );
+        let conn = self
+            .connections
+            .get_mut(&conn_id)
+            .expect("connection inserted");
         for datagram in pending.datagrams {
-            backend_socket
-                .send(&datagram)
-                .await
+            send_or_queue(&backend_socket, &mut conn.backend_writer, &datagram, None)
                 .context("flushing pending Initial datagram to backend")?;
         }
         Ok(())
@@ -1321,30 +1317,39 @@ fn spawn_backend_reader(
     conn_id: usize,
     socket: Arc<UdpSocket>,
     backend_events: tokio::sync::mpsc::Sender<BackendDatagram>,
+    pool: Arc<PacketPool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut buf = vec![0u8; MAX_DATAGRAM_SIZE];
         loop {
-            let n = match socket.recv(&mut buf).await {
-                Ok(n) => n,
+            if let Err(e) = socket.readable().await {
+                warn!("backend UDP readiness failed for connection id={conn_id}: {e:#}");
+                break;
+            }
+            // Wait for channel space before checking out a large receive buffer.
+            let Ok(permit) = backend_events.reserve().await else {
+                break;
+            };
+            let mut packet = pool.acquire();
+            match socket.try_recv(packet.buffer_mut()) {
+                Ok(len) => {
+                    packet.set_len(len);
+                    permit.send(BackendDatagram { conn_id, packet });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(e) => {
                     warn!("backend UDP recv failed for connection id={conn_id}: {e:#}");
                     break;
                 }
-            };
-            let packet = buf[..n].to_vec();
-            if backend_events
-                .send(BackendDatagram { conn_id, packet })
-                .await
-                .is_err()
-            {
-                break;
             }
         }
     })
 }
 
-async fn mainloop(sockets: ProxySockets, mut router: Router, config_filename: &str) -> Result<()> {
+async fn mainloop(
+    mut sockets: ProxySockets,
+    mut router: Router,
+    config_filename: &str,
+) -> Result<()> {
     let mut client_buf = vec![0u8; MAX_DATAGRAM_SIZE];
     let (backend_tx, mut backend_rx) = tokio::sync::mpsc::channel::<BackendDatagram>(1024);
     let mut hups = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
@@ -1362,7 +1367,7 @@ async fn mainloop(sockets: ProxySockets, mut router: Router, config_filename: &s
                         continue;
                     }
                 };
-                let packet = client_buf[..n].to_vec();
+                let packet = &client_buf[..n];
                 if let Err(e) = router.handle_datagram(peer, packet, &backend_tx).await {
                     warn!("handling client UDP datagram from {peer}: {e:#}");
                 }
@@ -1371,7 +1376,7 @@ async fn mainloop(sockets: ProxySockets, mut router: Router, config_filename: &s
                 let Some(datagram) = datagram else {
                     return Err(anyhow!("backend datagram channel closed"));
                 };
-                if let Err(e) = router.handle_backend_datagram(&sockets, datagram).await {
+                if let Err(e) = router.handle_backend_datagram(&mut sockets, datagram).await {
                     warn!("handling backend UDP datagram: {e:#}");
                 }
             }
@@ -1458,6 +1463,72 @@ mod tests {
     use super::*;
 
     const AEAD_TAG_LEN: usize = 16;
+
+    #[tokio::test]
+    async fn idle_and_channel_blocked_readers_do_not_hold_receive_buffers() -> Result<()> {
+        let backend = UdpSocket::bind("127.0.0.1:0").await?;
+        let pool = Arc::new(PacketPool::default());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let mut tasks = Vec::new();
+        let mut addresses = Vec::new();
+        for id in 0..64 {
+            let socket = Arc::new(connect_backend_socket(backend.local_addr()?).await?);
+            addresses.push(socket.local_addr()?);
+            tasks.push(spawn_backend_reader(id, socket, tx.clone(), pool.clone()));
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(
+            pool.allocated(),
+            0,
+            "idle readers allocated receive buffers"
+        );
+        for addr in addresses {
+            backend.send_to(b"reply", addr).await?;
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while rx.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        tokio::task::yield_now().await;
+        assert_eq!(pool.allocated(), 1, "channel waiters held receive buffers");
+        let datagram = rx.recv().await.unwrap();
+        assert_eq!(&*datagram.packet, b"reply");
+        for task in tasks {
+            task.abort();
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pooled_backend_receive_preserves_large_datagrams() -> Result<()> {
+        let backend = UdpSocket::bind("127.0.0.1:0").await?;
+        let socket = Arc::new(connect_backend_socket(backend.local_addr()?).await?);
+        let pool = Arc::new(PacketPool::default());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let task = spawn_backend_reader(7, socket.clone(), tx, pool.clone());
+        let payload = vec![0xab; 60_000];
+        backend.send_to(&payload, socket.local_addr()?).await?;
+        let datagram = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await?
+            .unwrap();
+        assert_eq!(datagram.conn_id, 7);
+        assert_eq!(&*datagram.packet, payload);
+        drop(datagram);
+        backend.send_to(&payload, socket.local_addr()?).await?;
+        let datagram = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await?
+            .unwrap();
+        assert_eq!(&*datagram.packet, payload);
+        assert_eq!(
+            pool.allocated(),
+            1,
+            "second datagram did not reuse its buffer"
+        );
+        task.abort();
+        Ok(())
+    }
 
     async fn make_config(s: &str) -> Result<Config> {
         let tmp_dir = tempfile::TempDir::new()?;
@@ -1736,7 +1807,7 @@ default: <
 
     #[tokio::test]
     async fn backend_reply_from_ipv4_on_dual_stack_socket_routes_to_client() -> Result<()> {
-        let sockets = ProxySockets::new("[::]:0".parse()?)?;
+        let mut sockets = ProxySockets::new("[::]:0".parse()?)?;
         let backend_addr = SocketAddr::from(([127, 0, 0, 1], 443));
         let backend_socket = Arc::new(connect_backend_socket(backend_addr).await?);
         let client_socket = UdpSocket::bind("[::1]:0").await?;
@@ -1762,6 +1833,7 @@ default: <
             conn_id,
             Connection {
                 backend_socket,
+                backend_writer: None,
                 backend_task: tokio::spawn(async {}),
                 client_addr,
                 cids: HashSet::from([client_cid.clone()]),
@@ -1775,10 +1847,10 @@ default: <
         let packet = long_packet_with_cids(&client_cid, b"server01");
         router
             .handle_backend_datagram(
-                &sockets,
+                &mut sockets,
                 BackendDatagram {
                     conn_id,
-                    packet: packet.clone(),
+                    packet: router.packet_pool.copy_packet(&packet),
                 },
             )
             .await?;
@@ -1793,7 +1865,7 @@ default: <
 
     #[tokio::test]
     async fn backend_reply_with_unknown_dcid_routes_by_unique_backend() -> Result<()> {
-        let sockets = ProxySockets::new("127.0.0.1:0".parse()?)?;
+        let mut sockets = ProxySockets::new("127.0.0.1:0".parse()?)?;
         let backend_addr = SocketAddr::from(([127, 0, 0, 1], 443));
         let backend_socket = Arc::new(connect_backend_socket(backend_addr).await?);
         let client_socket = UdpSocket::bind("127.0.0.1:0").await?;
@@ -1817,6 +1889,7 @@ default: <
             conn_id,
             Connection {
                 backend_socket,
+                backend_writer: None,
                 backend_task: tokio::spawn(async {}),
                 client_addr,
                 cids: HashSet::new(),
@@ -1831,10 +1904,10 @@ default: <
         let packet = long_packet_with_cids(&[], &server_cid);
         router
             .handle_backend_datagram(
-                &sockets,
+                &mut sockets,
                 BackendDatagram {
                     conn_id,
-                    packet: packet.clone(),
+                    packet: router.packet_pool.copy_packet(&packet),
                 },
             )
             .await?;
@@ -1876,6 +1949,7 @@ default: <
             conn_id,
             Connection {
                 backend_socket,
+                backend_writer: None,
                 backend_task: tokio::spawn(async {}),
                 client_addr,
                 cids: HashSet::new(),
@@ -1889,7 +1963,7 @@ default: <
         let packet = vec![0x40, 0xde, 0xad, 0xbe, 0xef];
         let (backend_tx, _backend_rx) = tokio::sync::mpsc::channel::<BackendDatagram>(1);
         router
-            .handle_datagram(client_addr, packet.clone(), &backend_tx)
+            .handle_datagram(client_addr, &packet, &backend_tx)
             .await?;
 
         let mut buf = [0u8; 2048];

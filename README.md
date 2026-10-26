@@ -158,6 +158,10 @@ connection IDs advertised later with `NEW_CONNECTION_ID`. Backends should keep
 using connection IDs visible during the Initial exchange for traffic that must
 pass through this router.
 
+UDP forwarding uses nonblocking sends. Congested sockets have a bounded queue
+of up to 32 datagrams and 128 KiB. Excess datagrams are dropped so backpressure
+on one backend does not stall routing for other connections.
+
 It uses the same asciiproto config format, but only `null` and `proxy` backends
 are supported. For `sni-router-h3`, `proxy.addr` is interpreted as a UDP backend
 address and TCP-only options such as `proxy_header`, `pass`, `frontend_tls`, and
