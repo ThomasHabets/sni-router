@@ -671,19 +671,18 @@ fn decrypt_initial_packet(packet: &[u8]) -> Result<DecryptedInitial> {
     }
 
     let mut packet_number = 0u64;
-    let mut packet_number_bytes = packet[header.packet_number_offset..packet_number_end].to_vec();
-    for (i, b) in packet_number_bytes.iter_mut().enumerate() {
-        *b ^= mask[i + 1];
-        packet_number = (packet_number << 8) | u64::from(*b);
-    }
-
     let mut associated_data = packet[..packet_number_end].to_vec();
     associated_data[0] = first;
-    associated_data[header.packet_number_offset..packet_number_end]
-        .copy_from_slice(&packet_number_bytes);
+    for (i, byte) in associated_data[header.packet_number_offset..]
+        .iter_mut()
+        .enumerate()
+    {
+        *byte ^= mask[i + 1];
+        packet_number = (packet_number << 8) | u64::from(*byte);
+    }
 
     let mut payload = packet[packet_number_end..header.packet_end].to_vec();
-    let plaintext = keys
+    let plaintext_len = keys
         .open
         .open_in_place(
             packet_nonce(&keys.iv, packet_number),
@@ -691,16 +690,17 @@ fn decrypt_initial_packet(packet: &[u8]) -> Result<DecryptedInitial> {
             &mut payload,
         )
         .map_err(|_| anyhow!("QUIC Initial decrypt failed"))?
-        .to_vec();
+        .len();
+    payload.truncate(plaintext_len);
 
     Ok(DecryptedInitial {
         dcid: header.cids.dcid,
         scid: header.cids.scid,
-        payload: plaintext,
+        payload,
     })
 }
 
-fn read_crypto_frames(payload: &[u8]) -> Result<Vec<(u64, Vec<u8>)>> {
+fn read_crypto_frames(payload: &[u8]) -> Result<Vec<(u64, &[u8])>> {
     let mut frames = Vec::new();
     let mut i = 0usize;
     while i < payload.len() {
@@ -718,7 +718,7 @@ fn read_crypto_frames(payload: &[u8]) -> Result<Vec<(u64, Vec<u8>)>> {
                 if payload.len() < i + len {
                     bail!("truncated CRYPTO frame");
                 }
-                frames.push((offset, payload[i..i + len].to_vec()));
+                frames.push((offset, &payload[i..i + len]));
                 i += len;
             }
             0x1c => {
@@ -775,55 +775,61 @@ fn skip_application_close_frame(payload: &[u8], i: &mut usize) -> Result<()> {
 
 #[derive(Default, Debug)]
 struct CryptoReassembly {
+    bytes: Vec<u8>,
     fragments: BTreeMap<u64, Vec<u8>>,
 }
 
 impl CryptoReassembly {
-    fn insert(&mut self, offset: u64, data: Vec<u8>) {
+    fn insert(&mut self, offset: u64, data: &[u8]) {
         if data.is_empty() {
             return;
         }
-        let old = self.fragments.get(&offset);
-        if old.is_none_or(|v| v.len() < data.len()) {
-            self.fragments.insert(offset, data);
+        let next = u64::try_from(self.bytes.len()).expect("usize fits in u64");
+        if offset > next {
+            if self
+                .fragments
+                .get(&offset)
+                .is_none_or(|old| old.len() < data.len())
+            {
+                self.fragments.insert(offset, data.to_vec());
+            }
+            return;
+        }
+        self.append(offset, data);
+        while self.fragments.first_key_value().is_some_and(|(offset, _)| {
+            *offset <= u64::try_from(self.bytes.len()).expect("usize fits in u64")
+        }) {
+            let (offset, fragment) = self.fragments.pop_first().expect("fragment available");
+            self.append(offset, &fragment);
         }
     }
 
-    fn contiguous(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        let mut next = 0u64;
-        for (offset, data) in &self.fragments {
-            if *offset > next {
-                break;
-            }
-            let start = usize::try_from(next - *offset).unwrap_or(usize::MAX);
-            if start >= data.len() {
-                continue;
-            }
-            out.extend_from_slice(&data[start..]);
-            next += u64::try_from(data.len() - start).expect("usize fits in u64");
+    fn append(&mut self, offset: u64, data: &[u8]) {
+        let next = u64::try_from(self.bytes.len()).expect("usize fits in u64");
+        let skip = usize::try_from(next - offset).unwrap_or(usize::MAX);
+        if let Some(suffix) = data.get(skip..) {
+            self.bytes.extend_from_slice(suffix);
         }
-        out
     }
 
-    fn clienthello(&self) -> Result<Option<Vec<u8>>> {
-        let bytes = self.contiguous();
-        if bytes.len() < 4 {
+    fn clienthello(&self) -> Result<Option<&[u8]>> {
+        if self.bytes.len() < 4 {
             return Ok(None);
         }
-        if bytes[0] != 1 {
+        if self.bytes[0] != 1 {
             bail!(
                 "first TLS handshake message in QUIC Initial is {}, expected ClientHello",
-                bytes[0]
+                self.bytes[0]
             );
         }
-        let body_len =
-            ((bytes[1] as usize) << 16) | ((bytes[2] as usize) << 8) | (bytes[3] as usize);
+        let body_len = ((self.bytes[1] as usize) << 16)
+            | ((self.bytes[2] as usize) << 8)
+            | (self.bytes[3] as usize);
         let needed = 4 + body_len;
-        if bytes.len() < needed {
+        if self.bytes.len() < needed {
             return Ok(None);
         }
-        Ok(Some(bytes[..needed].to_vec()))
+        Ok(Some(&self.bytes[..needed]))
     }
 }
 
@@ -1113,7 +1119,7 @@ impl Router {
             return Ok(());
         };
 
-        let sni = match extract_tls_sni(&clienthello) {
+        let sni = match extract_tls_sni(clienthello) {
             Ok(sni) => sni,
             Err(e) => {
                 warn!("using default backend for {peer} because ClientHello SNI parse failed: {e}");
@@ -1761,10 +1767,87 @@ default: <
         let hello = minimal_clienthello_sni("www.example.com");
         let split = hello.len() / 2;
         let mut crypto = CryptoReassembly::default();
-        crypto.insert(0, hello[..split].to_vec());
-        crypto.insert(0, hello[..split / 2].to_vec());
-        crypto.insert(u64::try_from(split)?, hello[split..].to_vec());
-        assert_eq!(crypto.clienthello()?, Some(hello));
+        crypto.insert(0, &hello[..split]);
+        crypto.insert(0, &hello[..split / 2]);
+        crypto.insert(u64::try_from(split)?, &hello[split..]);
+        assert_eq!(crypto.clienthello()?, Some(hello.as_slice()));
+        Ok(())
+    }
+
+    #[test]
+    fn crypto_reassembly_handles_gaps_overlaps_and_fragment_order() -> Result<()> {
+        let hello = minimal_clienthello_sni("www.example.com");
+        let cuts = [0, 10, 30, hello.len()];
+        for order in [[0, 1, 2], [2, 0, 1], [1, 2, 0], [2, 1, 0]] {
+            let mut crypto = CryptoReassembly::default();
+            for (step, part) in order.into_iter().enumerate() {
+                crypto.insert(
+                    u64::try_from(cuts[part])?,
+                    &hello[cuts[part]..cuts[part + 1]],
+                );
+                if step < 2 {
+                    assert!(crypto.clienthello()?.is_none());
+                }
+            }
+            assert_eq!(crypto.clienthello()?, Some(hello.as_slice()));
+            assert_eq!(
+                crypto.clienthello()?.unwrap().as_ptr(),
+                crypto.bytes.as_ptr()
+            );
+            assert!(crypto.fragments.is_empty());
+        }
+
+        let mut crypto = CryptoReassembly::default();
+        crypto.insert(20, &hello[20..50]);
+        crypto.insert(20, &hello[20..25]);
+        crypto.insert(10, &hello[10..30]);
+        crypto.insert(0, &hello[..15]);
+        assert_eq!(crypto.bytes, hello[..50]);
+        crypto.insert(45, &hello[45..]);
+        crypto.insert(0, &hello[..10]);
+        assert_eq!(crypto.clienthello()?, Some(hello.as_slice()));
+        crypto.insert(u64::MAX, b"sparse fragment");
+        assert_eq!(crypto.bytes.len(), hello.len());
+        Ok(())
+    }
+
+    #[test]
+    fn crypto_frames_borrow_the_decrypted_payload() -> Result<()> {
+        let payload = crypto_frame(0, b"hello");
+        let frames = read_crypto_frames(&payload)?;
+        assert_eq!(frames[0].1, b"hello");
+        assert_eq!(frames[0].1.as_ptr(), payload[3..].as_ptr());
+        assert!(read_crypto_frames(&payload[..payload.len() - 1]).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn initial_and_established_packets_reach_backend_unchanged() -> Result<()> {
+        let backend = UdpSocket::bind("127.0.0.1:0").await?;
+        let config = make_config(&format!(
+            "default: < backend: < proxy: < addr: \"{}\" > > >",
+            backend.local_addr()?
+        ))
+        .await?;
+        let mut router = Router::new(Arc::new(config), Duration::from_secs(60));
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let peer = "127.0.0.1:12345".parse()?;
+        let dcid = b"server01";
+        let hello = minimal_clienthello_sni("www.example.com");
+        let initial = protected_initial_packet(dcid, b"client01", &crypto_frame(0, &hello));
+        router.handle_datagram(peer, &initial, &tx).await?;
+        let mut buf = vec![0; MAX_DATAGRAM_SIZE];
+        let len = tokio::time::timeout(Duration::from_secs(2), backend.recv(&mut buf)).await??;
+        assert_eq!(&buf[..len], initial);
+        let mut packet = vec![0x40];
+        packet.extend_from_slice(dcid);
+        packet.extend_from_slice(b"encrypted application bytes");
+        router.handle_datagram(peer, &packet, &tx).await?;
+        let len = tokio::time::timeout(Duration::from_secs(2), backend.recv(&mut buf)).await??;
+        assert_eq!(&buf[..len], packet);
+        for (_, connection) in router.connections.drain() {
+            connection.backend_task.abort();
+        }
         Ok(())
     }
 
