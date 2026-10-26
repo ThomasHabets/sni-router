@@ -43,6 +43,7 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 mod privs;
+mod resolver;
 
 use anyhow::anyhow;
 use anyhow::{Context, Result, bail};
@@ -1159,7 +1160,7 @@ async fn connect_for_proxy(
     addr: &str,
     backend_tls: Option<Arc<rustls::ClientConfig>>,
 ) -> Result<tokio::net::TcpStream> {
-    let addrs = tokio::net::lookup_host(addr)
+    let addrs = resolver::lookup_host(addr)
         .await
         .context(format!("parsing backend address {addr}"))?;
     let mut conn = None;
@@ -1754,6 +1755,7 @@ async fn main() -> Result<()> {
             .collect::<Vec<_>>(),
         opt.allow_keylogging,
     )?;
+    resolver::start_hosts_reload()?;
     // Config.
     let config = load_config(&opt.config, opt.allow_keylogging)
         .context(format!("Loading config {:?}", opt.config))?;

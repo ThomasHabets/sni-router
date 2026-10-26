@@ -92,6 +92,22 @@ default: <
 >
 ```
 
+## DNS resolution
+
+The default `hickory-resolver` Cargo feature uses a shared asynchronous DNS
+resolver with caching and coalescing of identical in-flight queries. It reads
+the system DNS configuration at startup and reloads `/etc/hosts` every minute.
+If a hosts-file reload fails, the previous snapshot remains active and an error
+is logged. With `--restrict-dirs`, include the paths needed to read
+`/etc/resolv.conf` and `/etc/hosts`.
+
+Build with `cargo build --no-default-features` to use Tokio's system resolver
+instead. Numeric backend addresses bypass DNS in either build.
+
+TCP backend names are resolved for each new connection. HTTP/3 backend names
+are resolved when loading the configuration; send SIGHUP to refresh their
+configured addresses. Existing connections retain their selected backend.
+
 ## Frontend TLS
 
 SNI Router can terminate Frontend TLS, meaning SNI router is the only process

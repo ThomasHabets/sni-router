@@ -9,10 +9,15 @@ repository = "https://github.com/ThomasHabets/sni-router"
 description = "SNI router"
 keywords = ["web", "sni", "https"]
 
+[features]
+default = ["hickory-resolver"]
+hickory-resolver = ["dep:hickory-resolver"]
+
 [dependencies]
 anyhow = "1.0.102"
 caps = "0.5.6"
 clap = { version = "4.6.1", features = ["derive"] }
+hickory-resolver = { version = "0.26.3", optional = true, default-features = false, features = ["tokio", "system-config"] }
 ipnet = "2.12.0"
 ktls = "6.0.2"
 landlock = "0.4.4"

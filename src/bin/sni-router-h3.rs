@@ -9,9 +9,11 @@
 
 #[path = "../privs.rs"]
 mod privs;
+#[path = "../resolver.rs"]
+mod resolver;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6, ToSocketAddrs};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -135,14 +137,16 @@ fn load_acl(pb: &protos::Acl) -> Result<Acl> {
     })
 }
 
-fn resolve_one_addr(addr: &str) -> Result<SocketAddr> {
-    addr.to_socket_addrs()
+async fn resolve_one_addr(addr: &str) -> Result<SocketAddr> {
+    resolver::lookup_host(addr)
+        .await
         .with_context(|| format!("resolving backend address {addr:?}"))?
+        .into_iter()
         .next()
         .ok_or_else(|| anyhow!("backend address {addr:?} resolved to no socket addresses"))
 }
 
-fn load_backend(pb: &protos::Backend) -> Result<Backend> {
+async fn load_backend(pb: &protos::Backend) -> Result<Backend> {
     if pb.frontend_tls.is_some() {
         return Err(anyhow!(
             "frontend_tls is TCP-only and is not supported by sni-router-h3"
@@ -166,7 +170,7 @@ fn load_backend(pb: &protos::Backend) -> Result<Backend> {
                 ));
             }
             Ok(Backend::Udp {
-                addr: resolve_one_addr(&proxy.addr)?,
+                addr: resolve_one_addr(&proxy.addr).await?,
             })
         }
         protos::backend::BackendType::Pass(_) => Err(anyhow!(
@@ -175,7 +179,7 @@ fn load_backend(pb: &protos::Backend) -> Result<Backend> {
     }
 }
 
-fn load_rule(rule: &protos::Rule, is_default: bool) -> Result<Rule> {
+async fn load_rule(rule: &protos::Rule, is_default: bool) -> Result<Rule> {
     let re = if is_default {
         if let Some(r) = rule.regex.as_ref() {
             return Err(anyhow!("default rule can't have regex. Had {r}"));
@@ -204,11 +208,12 @@ fn load_rule(rule: &protos::Rule, is_default: bool) -> Result<Rule> {
             rule.backend
                 .as_ref()
                 .ok_or_else(|| anyhow!("rule missing backend"))?,
-        )?,
+        )
+        .await?,
     })
 }
 
-fn load_config(filename: &str) -> Result<Config> {
+async fn load_config(filename: &str) -> Result<Config> {
     let pool = prost_reflect::DescriptorPool::decode(PROTO_DESCRIPTOR)?;
     let md = pool
         .get_message_by_name("sni_router.SNIConfig")
@@ -233,7 +238,8 @@ fn load_config(filename: &str) -> Result<Config> {
                     .default
                     .ok_or_else(|| anyhow!("default rule is missing"))?,
                 true,
-            )?;
+            )
+            .await?;
             if !rule.re.as_str().is_empty() {
                 return Err(anyhow!("default rule can't have regex"));
             }
@@ -241,7 +247,7 @@ fn load_config(filename: &str) -> Result<Config> {
         },
     };
     for rule in protocfg.rules {
-        config.rules.push(load_rule(&rule, false)?);
+        config.rules.push(load_rule(&rule, false).await?);
     }
     Ok(config)
 }
@@ -1375,7 +1381,7 @@ async fn mainloop(sockets: ProxySockets, mut router: Router, config_filename: &s
                     .map(|c| c.display().to_string())
                     .unwrap_or_else(|_| "<unknown>".to_string());
                 info!("Got SIGHUP. Loading new config {config_filename:?} in cwd {cwd:?}");
-                match load_config(config_filename) {
+                match load_config(config_filename).await {
                     Ok(config) => router.set_config(Arc::new(config)),
                     Err(e) => error!(
                         "Failed to load config {config_filename:?}, staying with old config: {e}"
@@ -1436,8 +1442,10 @@ async fn main() -> Result<()> {
             .collect::<Vec<_>>(),
     )?;
 
-    let config =
-        load_config(&opt.config).with_context(|| format!("Loading config {:?}", opt.config))?;
+    resolver::start_hosts_reload()?;
+    let config = load_config(&opt.config)
+        .await
+        .with_context(|| format!("Loading config {:?}", opt.config))?;
     mainloop(
         sockets,
         Router::new(Arc::new(config), Duration::from_millis(opt.idle_timeout_ms)),
@@ -1452,11 +1460,11 @@ mod tests {
 
     const AEAD_TAG_LEN: usize = 16;
 
-    fn make_config(s: &str) -> Result<Config> {
+    async fn make_config(s: &str) -> Result<Config> {
         let tmp_dir = tempfile::TempDir::new()?;
         let config_file = tmp_dir.path().join("config.cfg");
         std::fs::write(&config_file, s)?;
-        load_config(config_file.to_str().unwrap())
+        load_config(config_file.to_str().unwrap()).await
     }
 
     fn hex_to_vec(s: &str) -> Vec<u8> {
@@ -1587,8 +1595,8 @@ mod tests {
         packet
     }
 
-    #[test]
-    fn h3_config_uses_proxy_addr_as_udp_backend() -> Result<()> {
+    #[tokio::test]
+    async fn h3_config_uses_proxy_addr_as_udp_backend() -> Result<()> {
         let config = make_config(
             r#"
 rules: <
@@ -1605,7 +1613,8 @@ default: <
     >
 >
 "#,
-        )?;
+        )
+        .await?;
         match &config.rules[0].backend {
             Backend::Udp { addr } => assert_eq!(addr.to_string(), "[::1]:8443"),
             other => panic!("unexpected backend {other:?}"),
@@ -1613,8 +1622,8 @@ default: <
         Ok(())
     }
 
-    #[test]
-    fn h3_config_rejects_tcp_only_pass_backend() {
+    #[tokio::test]
+    async fn h3_config_rejects_tcp_only_pass_backend() {
         let config = make_config(
             r#"
 default: <
@@ -1625,12 +1634,13 @@ default: <
     >
 >
 "#,
-        );
+        )
+        .await;
         assert!(config.is_err(), "unexpected config: {config:?}");
     }
 
-    #[test]
-    fn default_acl_controls_fallback_routes() -> Result<()> {
+    #[tokio::test]
+    async fn default_acl_controls_fallback_routes() -> Result<()> {
         for (peer, source) in [
             ("127.0.0.1:12345", "127.0.0.0/8"),
             ("[::ffff:127.0.0.1]:12345", "127.0.0.0/8"),
@@ -1650,7 +1660,8 @@ default: <
                 let config = make_config(&format!(
                     "default: < acl: < default_action: {default_action} {rules} >
                      backend: < proxy: < addr: \"127.0.0.1:443\" > > >"
-                ))?;
+                ))
+                .await?;
                 let router = Router::new(Arc::new(config), Duration::from_secs(60));
                 for sni in [None, Some("unmatched.example.com".to_string())] {
                     let route = router.route_for_sni(peer.parse()?, sni);
@@ -1732,15 +1743,18 @@ default: <
         let client_socket = UdpSocket::bind("[::1]:0").await?;
         let client_addr = client_socket.local_addr()?;
 
-        let config = Arc::new(make_config(
-            r#"
+        let config = Arc::new(
+            make_config(
+                r#"
 default: <
     backend: <
         null: <>
     >
 >
 "#,
-        )?);
+            )
+            .await?,
+        );
         let mut router = Router::new(config, Duration::from_secs(60));
         let conn_id = 7;
         let client_cid = b"client01".to_vec();
@@ -1786,15 +1800,18 @@ default: <
         let client_socket = UdpSocket::bind("127.0.0.1:0").await?;
         let client_addr = client_socket.local_addr()?;
 
-        let config = Arc::new(make_config(
-            r#"
+        let config = Arc::new(
+            make_config(
+                r#"
 default: <
     backend: <
         null: <>
     >
 >
 "#,
-        )?);
+            )
+            .await?,
+        );
         let mut router = Router::new(config, Duration::from_secs(60));
         let conn_id = 9;
         router.connections.insert(
@@ -1839,15 +1856,18 @@ default: <
         let backend_socket = Arc::new(connect_backend_socket(backend_addr).await?);
         let client_addr = SocketAddr::from(([127, 0, 0, 1], 49152));
 
-        let config = Arc::new(make_config(
-            r#"
+        let config = Arc::new(
+            make_config(
+                r#"
 default: <
     backend: <
         null: <>
     >
 >
 "#,
-        )?);
+            )
+            .await?,
+        );
         let mut router = Router::new(config, Duration::from_secs(60));
         let conn_id = 11;
         router
@@ -1884,7 +1904,7 @@ default: <
     async fn cleanup_preserves_newer_connection_from_same_client() -> Result<()> {
         let backend = UdpSocket::bind("127.0.0.1:0").await?;
         let backend_addr = backend.local_addr()?;
-        let config = make_config("default: < backend: < null: <> > >")?;
+        let config = make_config("default: < backend: < null: <> > >").await?;
         let mut router = Router::new(Arc::new(config), Duration::from_secs(60));
         let (tx, _rx) = tokio::sync::mpsc::channel(16);
         let peer: SocketAddr = "127.0.0.1:40001".parse()?;
@@ -1915,8 +1935,8 @@ default: <
         Ok(())
     }
 
-    #[test]
-    fn routing_regex_matches_entire_hostname() -> Result<()> {
+    #[tokio::test]
+    async fn routing_regex_matches_entire_hostname() -> Result<()> {
         assert!(compile_full_match("example[.]com)|(?:evil").is_err());
         for (pattern, hostname, expected) in [
             ("example[.]com|example[.]com[.]au", "example.com.au", true),
@@ -1946,7 +1966,7 @@ default: <
                 }),
                 ..Default::default()
             };
-            let rule = load_rule(&rule, false)?;
+            let rule = load_rule(&rule, false).await?;
             assert_eq!(
                 rule.re.is_match(hostname),
                 expected,
