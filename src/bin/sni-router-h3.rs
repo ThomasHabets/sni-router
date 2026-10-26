@@ -7,10 +7,14 @@
 
 #![allow(clippy::similar_names)]
 
+#[path = "../h3_cid_routes.rs"]
+mod cid_routes;
 #[path = "../privs.rs"]
 mod privs;
 #[path = "../resolver.rs"]
 mod resolver;
+
+use cid_routes::CidRoutes;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6};
@@ -893,7 +897,7 @@ struct Router {
     idle_timeout: Duration,
     next_connection_id: usize,
     connections: HashMap<usize, Connection>,
-    cid_routes: HashMap<Vec<u8>, usize>,
+    cid_routes: CidRoutes,
     client_routes: HashMap<SocketAddr, usize>,
     pending: HashMap<(SocketAddr, Vec<u8>), PendingConnection>,
 }
@@ -905,7 +909,7 @@ impl Router {
             idle_timeout,
             next_connection_id: 0,
             connections: HashMap::new(),
-            cid_routes: HashMap::new(),
+            cid_routes: CidRoutes::default(),
             client_routes: HashMap::new(),
             pending: HashMap::new(),
         }
@@ -1245,12 +1249,7 @@ impl Router {
         if packet.first().is_none_or(|first| first & 0x80 != 0) {
             return None;
         }
-        let dcid_and_rest = &packet[1..];
-        self.cid_routes
-            .iter()
-            .filter(|(cid, _)| !cid.is_empty() && dcid_and_rest.starts_with(cid.as_slice()))
-            .max_by_key(|(cid, _)| cid.len())
-            .map(|(_, conn_id)| *conn_id)
+        self.cid_routes.match_prefix(&packet[1..])
     }
 
     fn cleanup(&mut self) {
