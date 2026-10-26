@@ -116,7 +116,25 @@ message Backend {
         Tls frontend_tls = 6;
 }
 
+// QUIC-LB draft-ietf-quic-load-balancers-22 single-pass encoding.
+// Only sni-router-h3 uses these settings. Each CID has a four-byte server ID.
+message QuicLbConfig {
+        // 0..6; 7 is reserved for unroutable CIDs.
+        uint32 config_id = 1;
+        // AES-128 key: 32 hexadecimal characters, with optional whitespace.
+        string key_file = 2;
+        repeated QuicLbServer servers = 3;
+}
+
+message QuicLbServer {
+        optional uint32 server_id = 1;
+        // UDP backend address, resolved at config load time.
+        string addr = 2;
+}
+
 message SNIConfig {
+        repeated QuicLbConfig quic_lb = 5;
+
         repeated Rule rules = 1;
         Rule default = 2;
 

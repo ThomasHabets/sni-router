@@ -15,6 +15,7 @@ default = ["hickory-resolver"]
 hickory-resolver = ["dep:hickory-resolver"]
 
 [dependencies]
+aes = "0.8"
 anyhow = "1.0.102"
 caps = "0.5.6"
 clap = { version = "4.6.1", features = ["derive"] }

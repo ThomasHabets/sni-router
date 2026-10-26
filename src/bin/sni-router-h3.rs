@@ -11,6 +11,8 @@
 mod cid_routes;
 #[path = "../privs.rs"]
 mod privs;
+#[path = "../quic_lb.rs"]
+mod quic_lb;
 #[path = "../resolver.rs"]
 mod resolver;
 #[path = "../version.rs"]
@@ -105,7 +107,14 @@ struct Rule {
 }
 
 #[derive(Debug)]
+struct LbConfig {
+    codec: quic_lb::Codec,
+    servers: HashMap<u32, SocketAddr>,
+}
+
+#[derive(Debug)]
 struct Config {
+    quic_lb: Vec<LbConfig>,
     max_lifetime: Option<Duration>,
     handshake_timeout: Option<Duration>,
     rules: Vec<Rule>,
@@ -237,7 +246,29 @@ async fn load_config(filename: &str) -> Result<Config> {
     let dyn_msg = prost_reflect::DynamicMessage::parse_text_format(md, &txt)?;
     let protocfg: protos::SniConfig = dyn_msg.transcode_to()?;
 
+    let mut quic_lb = Vec::new();
+    let mut config_ids = HashSet::new();
+    for lb in protocfg.quic_lb {
+        let id = u8::try_from(lb.config_id).context("QUIC-LB configuration ID must be 0..6")?;
+        if !config_ids.insert(id) {
+            bail!("duplicate QUIC-LB configuration ID");
+        }
+        let codec = quic_lb::Codec::from_key_file(id, std::path::Path::new(&lb.key_file))?;
+        let mut servers = HashMap::new();
+        for server in lb.servers {
+            let sid = server.server_id.context("QUIC-LB server ID is required")?;
+            let addr = normalize_socket_addr(resolve_one_addr(&server.addr).await?);
+            if servers.insert(sid, addr).is_some() {
+                bail!("duplicate QUIC-LB server ID");
+            }
+        }
+        if servers.is_empty() {
+            bail!("QUIC-LB configuration requires at least one backend");
+        }
+        quic_lb.push(LbConfig { codec, servers });
+    }
     let mut config = Config {
+        quic_lb,
         max_lifetime: (protocfg.max_lifetime_ms > 0)
             .then(|| Duration::from_millis(protocfg.max_lifetime_ms)),
         handshake_timeout: (protocfg.handshake_timeout_ms > 0)
@@ -915,6 +946,9 @@ struct Router {
     next_connection_id: usize,
     connections: HashMap<usize, Connection>,
     cid_routes: CidRoutes,
+    // A path retains its own upstream source port and reply destination.
+    // Connections to one backend sharing a client address share this socket.
+    lb_paths: HashMap<(SocketAddr, SocketAddr), usize>,
     client_routes: HashMap<SocketAddr, HashSet<usize>>,
     pending: HashMap<(SocketAddr, Vec<u8>), PendingConnection>,
 }
@@ -928,6 +962,7 @@ impl Router {
             next_connection_id: 0,
             connections: HashMap::new(),
             cid_routes: CidRoutes::default(),
+            lb_paths: HashMap::new(),
             client_routes: HashMap::new(),
             pending: HashMap::new(),
         }
@@ -996,6 +1031,38 @@ impl Router {
         };
         trace!("Got packet with CIDS {long:?}");
 
+        // Decode before learned-CID and peer-affinity lookups. New CIDs are
+        // delivered in encrypted frames, so they need not have been observed.
+        let cid = match long.as_ref() {
+            Some(long) => Some(long.dcid.as_slice()),
+            None => packet.get(1..1 + quic_lb::CID_LEN),
+        };
+        if let Some(addr) = cid.and_then(|cid| self.lb_backend(cid)) {
+            let path_key = (normalize_socket_addr(peer), addr);
+            if let Some(id) = self.lb_paths.get(&path_key).copied() {
+                let conn = &self.connections[&id];
+                if conn.expired(Instant::now(), self.idle_timeout) {
+                    return Ok(());
+                }
+                return self
+                    .forward_established_client_datagram(id, peer, packet, None)
+                    .await;
+            }
+            let mut pending = PendingConnection::new(peer, Vec::new(), Instant::now());
+            pending.push_datagram(packet.to_vec())?;
+            return self
+                .establish_and_flush(
+                    pending,
+                    Route {
+                        backend: Backend::Udp { addr },
+                        timeout: self.config.max_lifetime,
+                        sni: None,
+                    },
+                    backend_events,
+                )
+                .await;
+        }
+
         let Some(conn_id) = conn_id else {
             return self
                 .handle_unrouted_client_datagram(peer, packet, long, backend_events)
@@ -1015,6 +1082,14 @@ impl Router {
             );
             Ok(())
         }
+    }
+
+    fn lb_backend(&self, cid: &[u8]) -> Option<SocketAddr> {
+        self.config.quic_lb.iter().find_map(|config| {
+            let plaintext = config.codec.decrypt(cid)?;
+            let id = u32::from_be_bytes(plaintext[..4].try_into().ok()?);
+            config.servers.get(&id).copied()
+        })
     }
 
     fn peer_connection_id(&self, peer: SocketAddr, now: Instant) -> Option<usize> {
@@ -1246,6 +1321,42 @@ impl Router {
             return Ok(());
         };
 
+        let path_key = (
+            normalize_socket_addr(pending.client_addr),
+            normalize_socket_addr(addr),
+        );
+        let lb_path = self.config.quic_lb.iter().any(|config| {
+            config
+                .servers
+                .values()
+                .any(|backend| *backend == path_key.1)
+        });
+        let addr = if lb_path { path_key.1 } else { addr };
+        if lb_path && let Some(id) = self.lb_paths.get(&path_key).copied() {
+            let now = Instant::now();
+            let conn = self.connections.get_mut(&id).expect("indexed QUIC-LB path");
+            if conn.expired(now, self.idle_timeout) {
+                return Ok(());
+            }
+            if let Some(timeout) = route.timeout {
+                let deadline = now + timeout;
+                conn.deadline = Some(conn.deadline.map_or(deadline, |old| old.min(deadline)));
+            }
+            for datagram in &pending.datagrams {
+                send_or_queue(
+                    &conn.backend_socket,
+                    &mut conn.backend_writer,
+                    datagram,
+                    None,
+                )?;
+            }
+            conn.last_seen = now;
+            self.add_cid_route(id, pending.initial_dcid);
+            for cid in pending.client_cids {
+                self.add_cid_route(id, cid);
+            }
+            return Ok(());
+        }
         let conn_id = self.next_connection_id;
         self.next_connection_id += 1;
         let now = Instant::now();
@@ -1288,6 +1399,9 @@ impl Router {
         for cid in cids {
             self.cid_routes.insert(cid, conn_id);
         }
+        if lb_path {
+            self.lb_paths.insert(path_key, conn_id);
+        }
         self.client_routes
             .entry(normalize_socket_addr(pending.client_addr))
             .or_default()
@@ -1308,7 +1422,7 @@ impl Router {
     }
 
     fn add_cid_route(&mut self, conn_id: usize, cid: Vec<u8>) {
-        if cid.is_empty() {
+        if cid.is_empty() || self.lb_backend(&cid).is_some() {
             return;
         }
         if let Some(conn) = self.connections.get_mut(&conn_id)
@@ -1353,6 +1467,9 @@ impl Router {
                 conn.backend_task.abort();
             }
         }
+
+        self.lb_paths
+            .retain(|_, id| self.connections.contains_key(id));
 
         let pending_timeout = self
             .config
@@ -2455,6 +2572,249 @@ default: <
                 "pattern={pattern:?} hostname={hostname:?}"
             );
         }
+        Ok(())
+    }
+
+    fn routable_packet(codec: &quic_lb::Codec, server_id: u32, nonce: u8) -> Vec<u8> {
+        let mut plaintext = [nonce; 16];
+        plaintext[..4].copy_from_slice(&server_id.to_be_bytes());
+        let mut packet = vec![0x40];
+        packet.extend_from_slice(&codec.encrypt(plaintext));
+        packet.extend_from_slice(b"encrypted application data");
+        packet
+    }
+
+    #[tokio::test]
+    async fn quic_lb_rotation_and_migration_preserve_paths() -> Result<()> {
+        let backend = UdpSocket::bind("127.0.0.1:0").await?;
+        let addr = backend.local_addr()?;
+        let client_a = UdpSocket::bind("127.0.0.1:0").await?;
+        let client_b = UdpSocket::bind("127.0.0.1:0").await?;
+        let peer_a = client_a.local_addr()?;
+        let peer_b = client_b.local_addr()?;
+        let mut sockets = ProxySockets::new("127.0.0.1:0".parse()?)?;
+        let mut config = make_config(&format!(
+            "max_lifetime_ms: 60000 default: < max_lifetime_ms: 1000 backend: < proxy: < addr: \"{addr}\" > > >"
+        )).await?;
+        let codec = quic_lb::Codec::new(0, &[0x55; 16])?;
+        config.quic_lb.push(LbConfig {
+            codec: codec.clone(),
+            servers: HashMap::from([(123, addr)]),
+        });
+        let mut router = Router::new(Arc::new(config), Duration::from_secs(60));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let initial = protected_initial_packet(
+            b"initial1",
+            b"client01",
+            &crypto_frame(0, &minimal_clienthello_sni("localhost")),
+        );
+        router.handle_datagram(peer_a, &initial, &tx).await?;
+        let mut buf = [0u8; 2048];
+        let (len, upstream_a) =
+            tokio::time::timeout(Duration::from_secs(2), backend.recv_from(&mut buf)).await??;
+        assert_eq!(&buf[..len], initial);
+        let original_deadline = router.connections[&0].deadline.unwrap();
+        for nonce in [1, 2] {
+            let packet = routable_packet(&codec, 123, nonce);
+            router.handle_datagram(peer_a, &packet, &tx).await?;
+            let (len, upstream) =
+                tokio::time::timeout(Duration::from_secs(2), backend.recv_from(&mut buf)).await??;
+            assert_eq!(upstream, upstream_a);
+            assert_eq!(&buf[..len], packet);
+        }
+        assert_eq!(router.lb_paths.len(), 1);
+        let migrated = routable_packet(&codec, 123, 3);
+        router.handle_datagram(peer_b, &migrated, &tx).await?;
+        let (len, upstream_b) =
+            tokio::time::timeout(Duration::from_secs(2), backend.recv_from(&mut buf)).await??;
+        assert_ne!(upstream_a, upstream_b);
+        assert_eq!(&buf[..len], migrated);
+        assert_eq!(router.lb_paths.len(), 2);
+        assert!(router.connections[&1].deadline.unwrap() > original_deadline);
+        // Backend packets from either path still go to that path's client.
+        for (upstream, client, response) in [
+            (upstream_b, &client_b, b"\x40reply-b".as_slice()),
+            (upstream_a, &client_a, b"\x40reply-a".as_slice()),
+        ] {
+            backend.send_to(response, upstream).await?;
+            let datagram = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await?
+                .unwrap();
+            router
+                .handle_backend_datagram(&mut sockets, datagram)
+                .await?;
+            let len = tokio::time::timeout(Duration::from_secs(2), client.recv(&mut buf)).await??;
+            assert_eq!(&buf[..len], response);
+        }
+        // Wrong server/config IDs and truncated packets cannot create paths.
+        let peer_c = "127.0.0.1:40003".parse()?;
+        let mut unknown_config = migrated.clone();
+        unknown_config[1] = 0xf0;
+        for packet in [
+            routable_packet(&codec, 999, 4),
+            unknown_config,
+            migrated[..8].to_vec(),
+        ] {
+            router.handle_datagram(peer_c, &packet, &tx).await?;
+        }
+        assert_eq!(router.lb_paths.len(), 2);
+        assert!(backend.try_recv_from(&mut buf).is_err());
+        router.connections.get_mut(&0).unwrap().last_seen =
+            Instant::now() - Duration::from_secs(61);
+        router.cleanup();
+        assert_eq!(router.lb_paths.len(), 1);
+        assert_eq!(router.lb_paths.get(&(peer_b, addr)), Some(&1));
+        for conn in router.connections.values() {
+            conn.backend_task.abort();
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn quic_lb_configuration_validation_and_rotation() -> Result<()> {
+        let key = tempfile::NamedTempFile::new()?;
+        std::fs::write(key.path(), "00000000000000000000000000000000\n")?;
+        let entry = format!(
+            "quic_lb: < config_id: 0 key_file: \"{}\" servers: < server_id: 0 addr: \"127.0.0.1:443\" > >",
+            key.path().display()
+        );
+        let default = "default: < backend: < null: <> > >";
+        let config = make_config(&format!(
+            "{entry} {} {default}",
+            entry.replace("config_id: 0", "config_id: 1")
+        ))
+        .await?;
+        assert_eq!(config.quic_lb.len(), 2);
+        assert!(
+            make_config(&format!("{entry} {entry} {default}"))
+                .await
+                .is_err()
+        );
+        for invalid in [
+            entry.replace("config_id: 0", "config_id: 7"),
+            entry.replace("server_id: 0", ""),
+            entry.replace("servers: < server_id: 0 addr: \"127.0.0.1:443\" >", ""),
+            entry.replace(
+                "servers: <",
+                "servers: < server_id: 0 addr: \"127.0.0.1:444\" > servers: <",
+            ),
+        ] {
+            assert!(make_config(&format!("{invalid} {default}")).await.is_err());
+        }
+        assert!(make_config(default).await?.quic_lb.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn quic_lb_shared_paths_and_reload_for_both_address_families() -> Result<()> {
+        for bind in ["127.0.0.1:0", "[::1]:0"] {
+            let backend = UdpSocket::bind(bind).await?;
+            let addr = backend.local_addr()?;
+            let client = UdpSocket::bind(bind).await?;
+            let peer = client.local_addr()?;
+            let text = format!(
+                "rules: < regex: \"short\" max_lifetime_ms: 1000 backend: < proxy: < addr: \"{addr}\" > > >
+                 default: < max_lifetime_ms: 60000 backend: < proxy: < addr: \"{addr}\" > > >"
+            );
+            let old_codec = quic_lb::Codec::new(0, &[0x55; 16])?;
+            let new_codec = quic_lb::Codec::new(1, &[0x66; 16])?;
+            let old_config = || LbConfig {
+                codec: old_codec.clone(),
+                servers: HashMap::from([(123, addr)]),
+            };
+            let mut config = make_config(&text).await?;
+            config.quic_lb.push(old_config());
+            let mut router = Router::new(Arc::new(config), Duration::from_secs(60));
+            let (tx, _rx) = tokio::sync::mpsc::channel(16);
+            let mut buf = [0; 2048];
+            let mut upstream_addr = None;
+            let mut old_deadline = None;
+            for (dcid, sni) in [(b"initial1", "long"), (b"initial2", "short")] {
+                let packet = protected_initial_packet(
+                    dcid,
+                    b"client01",
+                    &crypto_frame(0, &minimal_clienthello_sni(sni)),
+                );
+                router.handle_datagram(peer, &packet, &tx).await?;
+                let (len, upstream) =
+                    tokio::time::timeout(Duration::from_secs(2), backend.recv_from(&mut buf))
+                        .await??;
+                assert_eq!(&buf[..len], packet);
+                if let Some(previous) = upstream_addr {
+                    assert_eq!(upstream, previous);
+                } else {
+                    upstream_addr = Some(upstream);
+                    old_deadline = router.connections[&0].deadline;
+                }
+            }
+            assert_eq!(router.lb_paths.len(), 1);
+            assert_eq!(router.connections.len(), 1);
+            assert!(router.connections[&0].deadline < old_deadline);
+            let deadline = router.connections[&0].deadline;
+            assert_eq!(router.cid_routes.get(b"initial1"), Some(&0));
+            assert_eq!(router.cid_routes.get(b"initial2"), Some(&0));
+            let mut config = make_config(&text).await?;
+            config.quic_lb.push(old_config());
+            config.quic_lb.push(LbConfig {
+                codec: new_codec.clone(),
+                servers: HashMap::from([(123, addr)]),
+            });
+            router.set_config(Arc::new(config));
+            let normalized_peer = match peer {
+                SocketAddr::V4(v4) => {
+                    SocketAddr::new(IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port())
+                }
+                v6 => v6,
+            };
+            for codec in [&old_codec, &new_codec] {
+                let short = routable_packet(codec, 123, 9);
+                let long = long_packet_with_cids(&short[1..18], b"client02");
+                for packet in [short, long] {
+                    router
+                        .handle_datagram(normalized_peer, &packet, &tx)
+                        .await?;
+                    let (len, upstream) =
+                        tokio::time::timeout(Duration::from_secs(2), backend.recv_from(&mut buf))
+                            .await??;
+                    assert_eq!(&buf[..len], packet);
+                    assert_eq!(Some(upstream), upstream_addr);
+                }
+            }
+            assert_eq!(router.connections[&0].deadline, deadline);
+            assert_eq!(router.lb_paths.len(), 1);
+            for conn in router.connections.values() {
+                conn.backend_task.abort();
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn no_quic_lb_keeps_original_peer_restriction() -> Result<()> {
+        let backend = UdpSocket::bind("127.0.0.1:0").await?;
+        let addr = backend.local_addr()?;
+        let config = make_config(&format!(
+            "default: < backend: < proxy: < addr: \"{addr}\" > > >"
+        ))
+        .await?;
+        let mut router = Router::new(Arc::new(config), Duration::from_secs(60));
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let original = "127.0.0.1:40001".parse()?;
+        router
+            .establish_and_flush(
+                PendingConnection::new(original, b"original".to_vec(), Instant::now()),
+                router.route_for_sni(original, None)?,
+                &tx,
+            )
+            .await?;
+        let packet = [b"\x40".as_slice(), b"original", b"payload"].concat();
+        router
+            .handle_datagram("127.0.0.1:40002".parse()?, &packet, &tx)
+            .await?;
+        assert_backend_empty(&backend);
+        assert_eq!(router.connections[&0].client_addr, original);
+        assert!(router.lb_paths.is_empty());
+        router.connections[&0].backend_task.abort();
         Ok(())
     }
 }

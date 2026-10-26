@@ -164,7 +164,8 @@ unknown-CID packets are dropped until only one live connection remains.
 CID changes advertised in encrypted `NEW_CONNECTION_ID` frames work through
 peer affinity while the client IP address and port remain stable. The router
 does not learn those CIDs from the encrypted frames; client migration or NAT
-rebinding to a different address or port remains unsupported.
+rebinding to a different address or port requires the opt-in QUIC-LB mode
+described below.
 
 UDP forwarding uses nonblocking sends. Congested sockets have a bounded queue
 of up to 32 datagrams and 128 KiB. Excess datagrams are dropped so backpressure
@@ -194,3 +195,59 @@ default: <
         >
 >
 ```
+
+
+### Opt-in QUIC-LB routing and migration
+
+To route server CIDs that have never been visible in a handshake, configure
+QUIC-LB decoders and their backend mappings. With no `quic_lb` entries, routing
+behavior remains unchanged, including the restriction to the original client
+address.
+
+```text
+quic_lb: <
+        config_id: 0
+        key_file: "/etc/sni-router/quic-lb.key"
+        servers: < server_id: 123 addr: "[::1]:8443" >
+>
+rules: <
+        regex: "(www[.]|)example[.]com"
+        backend: < proxy: < addr: "[::1]:8443" > >
+>
+default: < backend: < null: <> > >
+```
+
+Start tarweb-h3 with `--quic-lb-key-file`, `--quic-lb-server-id 123`, and
+`--quic-lb-config-id 0` using the same key and configuration ID. Key files contain
+32 hexadecimal characters with optional surrounding whitespace; keep them
+readable only by the relevant services. Key-file paths, like other configuration
+paths, are relative to the process working directory. They must be accessible
+under `--restrict-dirs` for reloads.
+
+This implementation supports the 17-byte single-pass AES-128 encoding of
+`draft-ietf-quic-load-balancers-22`, with four-byte unsigned backend IDs.
+Configurations 0 through 6 may coexist. Decoding a mapped backend ID takes
+precedence over learned CID and client-address routing. CIDs without a configured
+mapping continue through the existing routing fallbacks.
+
+Initial packets with unroutable CIDs still undergo SNI routing and ACL checks.
+**A routable backend ID is sufficient authorization for forwarding**, including
+from a new client address; SNI ACLs are not checked again. QUIC-LB encryption is
+not client authentication: the backend authenticates packets and validates new
+paths using QUIC.
+
+Each client address/backend pair has its own upstream UDP socket, retained
+across CID changes. Replies return to the client address associated with that
+socket, so old and new paths can operate concurrently. Connections to the same
+backend sharing a client address also share the path. Path queues remain bounded
+as described above. Idle and global lifetime timers apply per path; initial SNI
+rules also contribute their deadlines, with the earliest deadline winning for
+shared paths. Migration creates a path with fresh global/idle timers and does
+not preserve the original connection's SNI rule lifetime limit.
+
+For rotation, install a new decoder with an unused configuration ID in the
+router first, then enable it on servers. Keep old configurations and backend
+mappings until their connections have drained. Backend IDs must remain stable
+within an active configuration. Configurations and key files reload on SIGHUP;
+invalid reloads leave the previous configuration active. Existing paths retain
+their upstream sockets and deadlines. Router restart recovery is not guaranteed.
