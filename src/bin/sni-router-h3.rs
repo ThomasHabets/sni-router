@@ -1292,7 +1292,7 @@ impl Router {
             .entry(normalize_socket_addr(pending.client_addr))
             .or_default()
             .insert(conn_id);
-        info!(
+        debug!(
             "routing QUIC connection id={conn_id} peer={} sni={:?} backend={addr} backend_socket={backend_socket_addr}",
             pending.client_addr, route.sni
         );
