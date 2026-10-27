@@ -197,6 +197,39 @@ default: <
 ```
 
 
+### Prometheus metrics
+
+Like the TCP binary, `sni-router-h3` can push metrics to a Prometheus
+Pushgateway. Export is disabled unless `--prometheus` is supplied:
+
+```sh
+sni-router-h3 --listen '[::]:443' --config h3.conf \
+    --prometheus http://localhost:9091 --prometheus-job sni-router-h3
+```
+
+Metrics are pushed immediately and then every minute from a separate thread.
+Failures are logged and retried at the next interval. `--prometheus-job` defaults
+to `sni-router-h3` (the TCP binary defaults to `sni-router`). Both use the hostname
+as the `instance` grouping label. There is no HTTP scrape endpoint.
+
+| Metric | Meaning |
+| --- | --- |
+| `quic_paths_total` | Backend UDP paths created, including QUIC-LB migration paths |
+| `quic_active_paths` | Retained backend UDP paths, removed on idle/lifetime cleanup |
+| `quic_pending_initials` | Initial packet reassemblies awaiting SNI routing |
+| `sni{sni="..."}` | ClientHellos reaching SNI routing; unmatched names use `<unknown>`, absent/unparseable names use `<missing>` |
+| `quic_routing_latency_ms` | Histogram from the first buffered Initial to an SNI routing decision |
+| `quic_received_datagrams_total{source="client\|backend"}` | Received UDP datagrams |
+| `quic_received_bytes_total{source="client\|backend"}` | Received UDP payload bytes |
+| `quic_routing_dropped_datagrams_total{reason="..."}` | Datagrams discarded by routing, including null/ACL rejection, invalid packets, missing/ambiguous peers, and pending timeouts |
+| `quic_errors_total{source="..."}` | Client receive errors and client/backend datagram handling errors |
+
+A path can carry multiple QUIC connections, and QUIC-LB routing can create paths
+without a ClientHello. These metrics do not measure completed TLS handshakes or
+HTTP requests. Routing drops exclude kernel/socket losses and bounded send queue
+losses. SNI labels for matching rules contain the client-supplied hostname, as in
+the TCP binary; broad regex rules can produce many distinct label values.
+
 ### Opt-in QUIC-LB routing and migration
 
 To route server CIDs that have never been visible in a handshake, configure

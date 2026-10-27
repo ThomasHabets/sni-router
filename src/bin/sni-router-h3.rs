@@ -9,6 +9,10 @@
 
 #[path = "../h3_cid_routes.rs"]
 mod cid_routes;
+#[path = "../h3_metrics.rs"]
+mod metrics;
+#[path = "../metrics_push.rs"]
+mod metrics_push;
 #[path = "../privs.rs"]
 mod privs;
 #[path = "../quic_lb.rs"]
@@ -78,6 +82,14 @@ struct Opt {
     /// Asciiproto config. For this binary, proxy.addr is interpreted as a UDP backend.
     #[arg(long, short)]
     config: String,
+
+    /// Prometheus push gateway url. E.g. http://localhost:9091.
+    #[arg(long)]
+    prometheus: Option<String>,
+
+    /// Prometheus job name.
+    #[arg(long, default_value = "sni-router-h3")]
+    prometheus_job: String,
 }
 
 #[derive(Debug, Clone)]
@@ -940,6 +952,7 @@ impl Connection {
 }
 
 struct Router {
+    metrics: metrics::Metrics,
     config: Arc<Config>,
     packet_pool: Arc<PacketPool>,
     idle_timeout: Duration,
@@ -957,6 +970,7 @@ impl Router {
     fn new(config: Arc<Config>, idle_timeout: Duration) -> Self {
         Self {
             config,
+            metrics: metrics::Metrics::default(),
             packet_pool: Arc::new(PacketPool::default()),
             idle_timeout,
             next_connection_id: 0,
@@ -1018,13 +1032,16 @@ impl Router {
         packet: &[u8],
         backend_events: &tokio::sync::mpsc::Sender<BackendDatagram>,
     ) -> Result<()> {
+        self.metrics.client.received(packet.len());
         if packet.is_empty() {
+            self.metrics.dropped("malformed", 1);
             debug!("dropping empty QUIC datagram from {peer}");
             return Ok(());
         }
         let (long, conn_id) = match self.packet_connection_id(packet) {
             Ok(route) => route,
             Err(e) => {
+                self.metrics.dropped("malformed", 1);
                 debug!("dropping datagram with malformed QUIC header from {peer}: {e}");
                 return Ok(());
             }
@@ -1042,6 +1059,7 @@ impl Router {
             if let Some(id) = self.lb_paths.get(&path_key).copied() {
                 let conn = &self.connections[&id];
                 if conn.expired(Instant::now(), self.idle_timeout) {
+                    self.metrics.dropped("expired", 1);
                     return Ok(());
                 }
                 return self
@@ -1076,6 +1094,7 @@ impl Router {
             self.forward_established_client_datagram(conn_id, peer, packet, long)
                 .await
         } else {
+            self.metrics.dropped("unexpected_peer", 1);
             debug!(
                 "dropping client datagram for connection id={conn_id} from unexpected peer {peer}; client={}",
                 conn.client_addr
@@ -1115,12 +1134,14 @@ impl Router {
         validate_initial: bool,
     ) -> Result<()> {
         let Some(id) = self.peer_connection_id(peer, Instant::now()) else {
+            self.metrics.dropped("no_unique_peer", 1);
             debug!("no unique live peer affinity for {peer}");
             return Ok(());
         };
         if validate_initial {
             let conn = self.connections.get(&id).expect("live peer connection");
             if let Err(e) = decrypt_initial_packet_with_dcid(packet, Some(&conn.initial_key_dcid)) {
+                self.metrics.dropped("invalid_initial", 1);
                 debug!("dropping Initial from {peer} that does not match connection id={id}: {e}");
                 return Ok(());
             }
@@ -1161,6 +1182,7 @@ impl Router {
         let new_cid = long.and_then(|long| (!long.scid.is_empty()).then_some(long.scid));
         let client_addr = {
             let Some(conn) = self.connections.get_mut(&conn_id) else {
+                self.metrics.dropped("stale_backend", 1);
                 return Ok(());
             };
             conn.last_seen = Instant::now();
@@ -1182,9 +1204,11 @@ impl Router {
         sockets: &mut ProxySockets,
         datagram: BackendDatagram,
     ) -> Result<()> {
+        self.metrics.backend.received(datagram.packet.len());
         let long = match parse_long_packet_cids(&datagram.packet) {
             Ok(long) => long,
             Err(e) => {
+                self.metrics.dropped("malformed_backend", 1);
                 debug!(
                     "dropping backend datagram for connection id={} with malformed QUIC header: {e}",
                     datagram.conn_id
@@ -1223,6 +1247,7 @@ impl Router {
                 .await;
         }
         if long.version != QUIC_VERSION_1 || long.packet_type != QUIC_PACKET_TYPE_INITIAL {
+            self.metrics.dropped("unsupported_packet", 1);
             debug!(
                 "dropping unrouted long-header client datagram from {peer}: version={:#x} type={}",
                 long.version, long.packet_type
@@ -1242,6 +1267,7 @@ impl Router {
         let crypto_frames = match read_crypto_frames(&decrypted.payload) {
             Ok(frames) => frames,
             Err(e) => {
+                self.metrics.dropped("invalid_frames", 1);
                 debug!("dropping QUIC Initial with unparsable frames from {peer}: {e}");
                 return Ok(());
             }
@@ -1250,10 +1276,10 @@ impl Router {
         let pending_key = (peer, decrypted.dcid.clone());
         let now = Instant::now();
         let clienthello = {
-            let pending = self
-                .pending
-                .entry(pending_key.clone())
-                .or_insert_with(|| PendingConnection::new(peer, decrypted.dcid.clone(), now));
+            let pending = self.pending.entry(pending_key.clone()).or_insert_with(|| {
+                self.metrics.pending.inc();
+                PendingConnection::new(peer, decrypted.dcid.clone(), now)
+            });
             pending.last_seen = now;
             if !decrypted.scid.is_empty() {
                 pending.client_cids.insert(decrypted.scid);
@@ -1277,10 +1303,20 @@ impl Router {
                 None
             }
         };
+        let label = match sni.as_deref() {
+            Some(name) if self.config.rules.iter().any(|rule| rule.re.is_match(name)) => name,
+            Some(_) => "<unknown>",
+            None => "<missing>",
+        };
+        self.metrics.sni.with_label_values(&[label]).inc();
         let route = self.route_for_sni(peer, sni)?;
         let Some(pending) = self.pending.remove(&pending_key) else {
             return Ok(());
         };
+        self.metrics.pending.set(self.pending.len() as i64);
+        self.metrics
+            .routing_latency
+            .observe(pending.created.elapsed().as_secs_f64() * 1000.0);
         self.establish_and_flush(pending, route, backend_events)
             .await
     }
@@ -1314,6 +1350,8 @@ impl Router {
         backend_events: &tokio::sync::mpsc::Sender<BackendDatagram>,
     ) -> Result<()> {
         let Backend::Udp { addr } = route.backend else {
+            self.metrics
+                .dropped("null_backend", pending.datagrams.len());
             debug!(
                 "dropping QUIC connection from {} with SNI {:?}: null backend",
                 pending.client_addr, route.sni
@@ -1336,6 +1374,7 @@ impl Router {
             let now = Instant::now();
             let conn = self.connections.get_mut(&id).expect("indexed QUIC-LB path");
             if conn.expired(now, self.idle_timeout) {
+                self.metrics.dropped("expired", pending.datagrams.len());
                 return Ok(());
             }
             if let Some(timeout) = route.timeout {
@@ -1396,6 +1435,8 @@ impl Router {
                 sni: route.sni.clone(),
             },
         );
+        self.metrics.paths.inc();
+        self.metrics.active_paths.inc();
         for cid in cids {
             self.cid_routes.insert(cid, conn_id);
         }
@@ -1448,6 +1489,7 @@ impl Router {
             .collect();
         for conn_id in expired {
             if let Some(conn) = self.connections.remove(&conn_id) {
+                self.metrics.active_paths.dec();
                 debug!(
                     "forgetting QUIC connection id={conn_id} sni={:?} age_ms={} idle_ms={}",
                     conn.sni,
@@ -1480,6 +1522,8 @@ impl Router {
             let keep = now.duration_since(pending.last_seen) < pending_timeout
                 && now.duration_since(pending.created) < pending_timeout;
             if !keep {
+                self.metrics
+                    .dropped("pending_timeout", pending.datagrams.len());
                 debug!(
                     "dropping pending QUIC Initial state from {} after {} ms",
                     pending.client_addr,
@@ -1488,6 +1532,7 @@ impl Router {
             }
             keep
         });
+        self.metrics.pending.set(self.pending.len() as i64);
     }
 }
 
@@ -1556,12 +1601,14 @@ async fn mainloop(
                 let (n, peer) = match r {
                     Ok(r) => r,
                     Err(e) => {
+                        router.metrics.errors.with_label_values(&["client_receive"]).inc();
                         error!("client UDP recv failed: {e:#}");
                         continue;
                     }
                 };
                 let packet = &client_buf[..n];
                 if let Err(e) = router.handle_datagram(peer, packet, &backend_tx).await {
+                    router.metrics.errors.with_label_values(&["client"]).inc();
                     warn!("handling client UDP datagram from {peer}: {e:#}");
                 }
             }
@@ -1570,6 +1617,7 @@ async fn mainloop(
                     return Err(anyhow!("backend datagram channel closed"));
                 };
                 if let Err(e) = router.handle_backend_datagram(&mut sockets, datagram).await {
+                    router.metrics.errors.with_label_values(&["backend"]).inc();
                     warn!("handling backend UDP datagram: {e:#}");
                 }
             }
@@ -1639,12 +1687,11 @@ async fn main() -> Result<()> {
     let config = load_config(&opt.config)
         .await
         .with_context(|| format!("Loading config {:?}", opt.config))?;
-    mainloop(
-        sockets,
-        Router::new(Arc::new(config), Duration::from_millis(opt.idle_timeout_ms)),
-        &opt.config,
-    )
-    .await
+    let router = Router::new(Arc::new(config), Duration::from_millis(opt.idle_timeout_ms));
+    if let Some(url) = opt.prometheus {
+        metrics_push::start(router.metrics.registry.clone(), opt.prometheus_job, url)?;
+    }
+    mainloop(sockets, router, &opt.config).await
 }
 
 #[cfg(test)]
@@ -1652,6 +1699,147 @@ mod tests {
     use super::*;
 
     const AEAD_TAG_LEN: usize = 16;
+
+    #[tokio::test]
+    async fn metrics_track_routing_traffic_drops_and_expiry() -> Result<()> {
+        let backend = UdpSocket::bind("127.0.0.1:0").await?;
+        let config = make_config(&format!(
+            "rules: < regex: \"good[.]example\" backend: < proxy: < addr: \"{}\" > > > default: < backend: < null: <> > >",
+            backend.local_addr()?
+        )).await?;
+        let mut router = Router::new(Arc::new(config), Duration::from_secs(60));
+        let peer = "127.0.0.1:12345".parse()?;
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let hello = minimal_clienthello_sni("good.example");
+        let split = hello.len() / 2;
+        let first = protected_initial_packet(b"initial1", b"", &crypto_frame(0, &hello[..split]));
+        let second = protected_initial_packet(
+            b"initial1",
+            b"",
+            &crypto_frame(split as u64, &hello[split..]),
+        );
+        router.handle_datagram(peer, &first, &tx).await?;
+        assert_eq!(router.metrics.pending.get(), 1);
+        assert_eq!(router.metrics.paths.get(), 0);
+        router.handle_datagram(peer, &second, &tx).await?;
+        assert_eq!(receive_backend_packet(&backend).await?, first);
+        assert_eq!(receive_backend_packet(&backend).await?, second);
+        assert_eq!(router.metrics.pending.get(), 0);
+        assert_eq!(router.metrics.paths.get(), 1);
+        assert_eq!(router.metrics.active_paths.get(), 1);
+        assert_eq!(
+            router
+                .metrics
+                .sni
+                .with_label_values(&["good.example"])
+                .get(),
+            1
+        );
+        assert_eq!(router.metrics.routing_latency.get_sample_count(), 1);
+        assert_eq!(router.metrics.client.datagrams.get(), 2);
+        assert_eq!(
+            router.metrics.client.bytes.get(),
+            (first.len() + second.len()) as u64
+        );
+
+        let denied = protected_initial_packet(
+            b"initial2",
+            b"",
+            &crypto_frame(0, &minimal_clienthello_sni("other.example")),
+        );
+        router.handle_datagram(peer, &denied, &tx).await?;
+        assert_eq!(
+            router.metrics.sni.with_label_values(&["<unknown>"]).get(),
+            1
+        );
+        assert_eq!(
+            router
+                .metrics
+                .drops
+                .with_label_values(&["null_backend"])
+                .get(),
+            1
+        );
+        assert_eq!(router.metrics.paths.get(), 1);
+        router.handle_datagram(peer, &[], &tx).await?;
+        assert_eq!(
+            router.metrics.drops.with_label_values(&["malformed"]).get(),
+            1
+        );
+
+        let mut sockets = ProxySockets::new("127.0.0.1:0".parse()?)?;
+        let malformed = router.packet_pool.copy_packet(&[0x80]);
+        router
+            .handle_backend_datagram(
+                &mut sockets,
+                BackendDatagram {
+                    conn_id: 0,
+                    packet: malformed,
+                },
+            )
+            .await?;
+        assert_eq!(router.metrics.backend.datagrams.get(), 1);
+        assert_eq!(router.metrics.backend.bytes.get(), 1);
+        assert_eq!(
+            router
+                .metrics
+                .drops
+                .with_label_values(&["malformed_backend"])
+                .get(),
+            1
+        );
+
+        router.connections.get_mut(&0).unwrap().last_seen =
+            Instant::now() - Duration::from_secs(61);
+        router.cleanup();
+        assert_eq!(router.metrics.active_paths.get(), 0);
+        assert_eq!(router.metrics.paths.get(), 1);
+        let incomplete =
+            protected_initial_packet(b"initial3", b"", &crypto_frame(0, &hello[..split]));
+        router.handle_datagram(peer, &incomplete, &tx).await?;
+        assert_eq!(router.metrics.pending.get(), 1);
+        router.pending.values_mut().next().unwrap().created =
+            Instant::now() - Duration::from_secs(61);
+        router.cleanup();
+        assert_eq!(router.metrics.pending.get(), 0);
+        assert_eq!(
+            router
+                .metrics
+                .drops
+                .with_label_values(&["pending_timeout"])
+                .get(),
+            1
+        );
+        let families = router.metrics.registry.gather();
+        assert!(
+            families
+                .iter()
+                .any(|family| family.name() == "quic_active_paths")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prometheus_flags_are_opt_in() -> Result<()> {
+        let defaults = Opt::try_parse_from(["sni-router-h3", "-c", "h3.conf"])?;
+        assert!(defaults.prometheus.is_none());
+        assert_eq!(defaults.prometheus_job, "sni-router-h3");
+        let configured = Opt::try_parse_from([
+            "sni-router-h3",
+            "-c",
+            "h3.conf",
+            "--prometheus",
+            "http://localhost:9091",
+            "--prometheus-job",
+            "custom-h3",
+        ])?;
+        assert_eq!(
+            configured.prometheus.as_deref(),
+            Some("http://localhost:9091")
+        );
+        assert_eq!(configured.prometheus_job, "custom-h3");
+        Ok(())
+    }
 
     #[tokio::test]
     async fn idle_and_channel_blocked_readers_do_not_hold_receive_buffers() -> Result<()> {
@@ -2782,6 +2970,9 @@ default: <
             }
             assert_eq!(router.connections[&0].deadline, deadline);
             assert_eq!(router.lb_paths.len(), 1);
+            assert_eq!(router.metrics.paths.get(), 1);
+            assert_eq!(router.metrics.active_paths.get(), 1);
+            assert_eq!(router.metrics.routing_latency.get_sample_count(), 2);
             for conn in router.connections.values() {
                 conn.backend_task.abort();
             }

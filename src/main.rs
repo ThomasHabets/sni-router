@@ -42,6 +42,7 @@ use prometheus::Histogram;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
+mod metrics_push;
 mod privs;
 mod resolver;
 mod version;
@@ -104,31 +105,6 @@ static HANDSHAKE_LATENCY: LazyLock<prometheus::Histogram> = LazyLock::new(|| {
     REGISTRY.register(Box::new(metric.clone())).unwrap();
     metric
 });
-
-static HOSTNAME: LazyLock<String> = LazyLock::new(|| {
-    std::env::var("HOSTNAME")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| {
-            std::fs::read_to_string("/etc/hostname")
-                .map(|s| s.trim_end().to_owned())
-                .unwrap_or_else(|_| "unknown".to_owned())
-        })
-});
-
-fn push_metrics(job: &str, url: &str) -> Result<()> {
-    info!("Pushing metrics");
-    let grouping = std::collections::HashMap::from([("instance".to_string(), (*HOSTNAME).clone())]);
-
-    prometheus::push_metrics(
-        job,
-        grouping,
-        url,
-        REGISTRY.gather(),
-        None, // optional basic auth
-    )?;
-    Ok(())
-}
 
 /// Load certificate chain from file.
 ///
@@ -1756,21 +1732,8 @@ async fn main() -> Result<()> {
     let config = load_config(&opt.config, opt.allow_keylogging)
         .context(format!("Loading config {:?}", opt.config))?;
 
-    if let Some(url) = &opt.prometheus {
-        let url = url.clone();
-        let job = opt.prometheus_job.clone();
-        std::thread::Builder::new()
-            .name("prometheus-pusher".to_string())
-            .spawn(move || {
-                loop {
-                    if let Err(err) = push_metrics(&job, &url) {
-                        eprintln!("failed to push prometheus metrics: {err}");
-                    }
-
-                    std::thread::sleep(std::time::Duration::from_mins(1));
-                }
-            })
-            .expect("spawn prometheus pusher thread");
+    if let Some(url) = opt.prometheus {
+        metrics_push::start(REGISTRY.clone(), opt.prometheus_job, url)?;
     }
     mainloop(
         Arc::new(config),
