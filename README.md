@@ -224,6 +224,19 @@ readable only by the relevant services. Key-file paths, like other configuration
 paths, are relative to the process working directory. They must be accessible
 under `--restrict-dirs` for reloads.
 
+Generate a random 128-bit QUIC-LB key with OpenSSL:
+
+```sh
+(umask 077; openssl rand -hex 16 > quic-lb.key)
+```
+
+This creates a file containing 32 hexadecimal characters and a newline, with
+read and write permissions for its owner only. Place it at the configured
+`key_file` path (`/etc/sni-router/quic-lb.key` in the example), adjusting ownership
+so the router can read it. Give tarweb-h3 a copy of the same key file and pass its
+path to `--quic-lb-key-file`. Generate the key once for both services; generating
+separate keys will prevent the router from decoding the backend's CIDs.
+
 This implementation supports the 17-byte single-pass AES-128 encoding of
 `draft-ietf-quic-load-balancers-22`, with four-byte unsigned backend IDs.
 Configurations 0 through 6 may coexist. Decoding a mapped backend ID takes
