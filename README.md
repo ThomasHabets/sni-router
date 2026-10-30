@@ -122,6 +122,11 @@ socket off over a UNIX domain socket, the backend doesn't have to deal with TLS.
 This thanks to kTLS, having the kernel do the TLS leaving user space to work in
 plain text.
 
+If using kTLS, if the peer initiates TLS 1.3 Key Update, the connection will
+fail with `EKEYEXPIRED`. Since the handed-to process doesn't have access to the
+previous key material, it is unable to handle a key update. See [kernel
+docs](https://kernel.org/doc/html/latest/networking/tls.html).
+
 ## Unix domain socket handoff
 
 On unix systems you can hand off a file descriptor from one process to another,
