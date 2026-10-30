@@ -7,14 +7,18 @@ pub(crate) struct CidRoutes {
 }
 
 impl CidRoutes {
-    pub(crate) fn insert(&mut self, cid: Vec<u8>, conn_id: usize) -> Option<usize> {
+    /// Register a CID without replacing another connection's ownership.
+    pub(crate) fn insert(&mut self, cid: Vec<u8>, conn_id: usize) -> bool {
         if cid.is_empty() {
-            return None;
+            return false;
         }
-        self.by_length
-            .entry(cid.len())
-            .or_default()
-            .insert(cid, conn_id)
+        match self.by_length.entry(cid.len()).or_default().entry(cid) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(conn_id);
+                true
+            }
+            std::collections::hash_map::Entry::Occupied(entry) => *entry.get() == conn_id,
+        }
     }
 
     pub(crate) fn get(&self, cid: &[u8]) -> Option<&usize> {
@@ -58,17 +62,19 @@ mod tests {
     }
 
     #[test]
-    fn replacing_and_removing_routes_keeps_lengths_consistent() {
+    fn collisions_preserve_ownership_and_removal_keeps_lengths_consistent() {
         let mut routes = CidRoutes::default();
         routes.insert(b"abc".to_vec(), 1);
         routes.insert(b"def".to_vec(), 2);
-        assert_eq!(routes.insert(b"abc".to_vec(), 3), Some(1));
-        assert_eq!(routes.get(b"abc"), Some(&3));
-        assert_eq!(routes.remove(b"abc"), Some(3));
+        assert!(routes.insert(b"abc".to_vec(), 1));
+        assert!(!routes.insert(b"abc".to_vec(), 3));
+        assert_eq!(routes.get(b"abc"), Some(&1));
+        assert_eq!(routes.match_prefix(b"abc-payload"), Some(1));
+        assert_eq!(routes.remove(b"abc"), Some(1));
         assert_eq!(routes.match_prefix(b"def-data"), Some(2));
         routes.remove(b"def");
         assert!(routes.by_length.is_empty());
-        routes.insert(vec![], 4);
+        assert!(!routes.insert(vec![], 4));
         assert_eq!(routes.match_prefix(b"anything"), None);
     }
 }

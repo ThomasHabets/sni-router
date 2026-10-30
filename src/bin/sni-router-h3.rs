@@ -1380,7 +1380,25 @@ impl Router {
                 .any(|backend| *backend == path_key.1)
         });
         let addr = if lb_path { path_key.1 } else { addr };
-        if lb_path && let Some(id) = self.lb_paths.get(&path_key).copied() {
+        let existing_id = lb_path
+            .then(|| self.lb_paths.get(&path_key).copied())
+            .flatten();
+        let conn_id = existing_id.unwrap_or(self.next_connection_id);
+        // Reject the entire registration before creating a socket, forwarding
+        // buffered datagrams, or partially inserting any of its CIDs.
+        for cid in std::iter::once(&pending.initial_dcid).chain(pending.client_cids.iter()) {
+            if let Some(owner) = self.cid_routes.get(cid)
+                && *owner != conn_id
+            {
+                debug!(
+                    "rejecting QUIC CID registration for connection id={conn_id}: owned by id={owner}"
+                );
+                self.metrics
+                    .dropped("cid_collision", pending.datagrams.len());
+                return Ok(());
+            }
+        }
+        if let Some(id) = existing_id {
             let now = Instant::now();
             let conn = self.connections.get_mut(&id).expect("indexed QUIC-LB path");
             if conn.expired(now, self.idle_timeout) {
@@ -1406,7 +1424,6 @@ impl Router {
             }
             return Ok(());
         }
-        let conn_id = self.next_connection_id;
         self.next_connection_id += 1;
         let now = Instant::now();
         let deadline = route.timeout.map(|timeout| now + timeout);
@@ -1476,10 +1493,15 @@ impl Router {
         if cid.is_empty() || self.lb_backend(&cid).is_some() {
             return;
         }
-        if let Some(conn) = self.connections.get_mut(&conn_id)
-            && conn.cids.insert(cid.clone())
-        {
-            self.cid_routes.insert(cid, conn_id);
+        if let Some(conn) = self.connections.get_mut(&conn_id) {
+            if conn.cids.contains(&cid) {
+                return;
+            }
+            if !self.cid_routes.insert(cid.clone(), conn_id) {
+                debug!("ignoring conflicting QUIC CID registration for connection id={conn_id}");
+                return;
+            }
+            conn.cids.insert(cid);
         }
     }
 
@@ -1507,7 +1529,9 @@ impl Router {
                     now.duration_since(conn.last_seen).as_millis()
                 );
                 for cid in conn.cids {
-                    self.cid_routes.remove(&cid);
+                    if self.cid_routes.get(&cid) == Some(&conn_id) {
+                        self.cid_routes.remove(&cid);
+                    }
                 }
                 let client = normalize_socket_addr(conn.client_addr);
                 if let Some(ids) = self.client_routes.get_mut(&client) {
@@ -2271,6 +2295,104 @@ mod tests {
         assert_eq!(router.connections[&1].last_seen, last_seen);
         router.cleanup();
         assert!(!router.client_routes.contains_key(&peer));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cid_collisions_preserve_owner_during_registration_and_cleanup() -> Result<()> {
+        for quic_lb_enabled in [false, true] {
+            let client = UdpSocket::bind("127.0.0.1:0").await?;
+            let peer = client.local_addr()?;
+            let other_client = UdpSocket::bind("127.0.0.1:0").await?;
+            let other_peer = other_client.local_addr()?;
+            let (mut router, backend) = peer_fixture(peer).await?;
+            if quic_lb_enabled {
+                let mut config = make_config(&format!(
+                    "default: < backend: < proxy: < addr: \"{}\" > > >",
+                    backend.local_addr()?
+                ))
+                .await?;
+                config.quic_lb.push(LbConfig {
+                    codec: quic_lb::Codec::new(0, &[0x55; 16])?,
+                    servers: HashMap::from([(123, backend.local_addr()?)]),
+                });
+                router.set_config(Arc::new(config));
+            }
+            let (tx, _rx) = tokio::sync::mpsc::channel(8);
+            let hello = crypto_frame(0, &minimal_clienthello_sni("good.example"));
+            let clash = protected_initial_packet(b"attacker", b"original", &hello);
+            router.handle_datagram(other_peer, &clash, &tx).await?;
+            assert_backend_empty(&backend);
+            assert_eq!(router.connections.len(), 1);
+            assert_eq!(router.next_connection_id, 1);
+            assert_eq!(router.cid_routes.get(b"original"), Some(&0));
+            assert!(router.cid_routes.get(b"attacker").is_none());
+            assert!(!router.client_routes.contains_key(&other_peer));
+            assert_eq!(
+                router
+                    .metrics
+                    .drops
+                    .with_label_values(&["cid_collision"])
+                    .get(),
+                1
+            );
+
+            // Establish another path with unique CIDs.
+            let initial = protected_initial_packet(b"another1", b"client02", &hello);
+            router.handle_datagram(other_peer, &initial, &tx).await?;
+            assert_eq!(receive_backend_packet(&backend).await?, initial);
+            assert_eq!(router.cid_routes.get(b"another1"), Some(&1));
+
+            if quic_lb_enabled {
+                // A new handshake reusing an existing QUIC-LB path must also
+                // reject collisions before forwarding or registering any CID.
+                let last_seen = router.connections[&1].last_seen;
+                let shared = protected_initial_packet(b"another2", b"original", &hello);
+                router.handle_datagram(other_peer, &shared, &tx).await?;
+                assert_backend_empty(&backend);
+                assert_eq!(router.connections[&1].last_seen, last_seen);
+                assert!(router.cid_routes.get(b"another2").is_none());
+            }
+
+            // Later client and backend headers cannot claim an existing CID.
+            let mut packet = long_packet_with_cids(b"another1", b"original");
+            packet[0] = 0xe0;
+            router.handle_datagram(other_peer, &packet, &tx).await?;
+            assert_eq!(receive_backend_packet(&backend).await?, packet);
+            let mut sockets = ProxySockets::new("127.0.0.1:0".parse()?)?;
+            let reply = long_packet_with_cids(b"client02", b"original");
+            router
+                .handle_backend_datagram(
+                    &mut sockets,
+                    BackendDatagram {
+                        conn_id: 1,
+                        packet: router.packet_pool.copy_packet(&reply),
+                    },
+                )
+                .await?;
+            assert_eq!(receive_backend_packet(&other_client).await?, reply);
+            assert_eq!(router.cid_routes.get(b"original"), Some(&0));
+            assert!(!router.connections[&1].cids.contains(b"original".as_slice()));
+
+            // Re-registering a CID for its owner is harmless.
+            router.add_cid_route(0, b"original".to_vec());
+            assert_eq!(router.cid_routes.get(b"original"), Some(&0));
+            router.connections.get_mut(&1).unwrap().deadline = Some(Instant::now());
+            router.cleanup();
+            assert_eq!(router.cid_routes.get(b"original"), Some(&0));
+            assert!(router.cid_routes.get(b"another1").is_none());
+            let packet = [b"\x40".as_slice(), b"original", b"payload"].concat();
+            router.handle_datagram(peer, &packet, &tx).await?;
+            assert_eq!(receive_backend_packet(&backend).await?, packet);
+
+            // Once the owner is removed, the CID is available again.
+            router.connections.get_mut(&0).unwrap().deadline = Some(Instant::now());
+            router.cleanup();
+            router.handle_datagram(other_peer, &clash, &tx).await?;
+            assert_eq!(receive_backend_packet(&backend).await?, clash);
+            assert_eq!(router.cid_routes.get(b"original"), Some(&2));
+            router.connections[&2].backend_task.abort();
+        }
         Ok(())
     }
 

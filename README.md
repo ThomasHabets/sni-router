@@ -161,6 +161,11 @@ ACL evaluation, even when the client address and port already have a route.
 Multiple connections may share a client address and port, but ambiguous
 unknown-CID packets are dropped until only one live connection remains.
 
+An already registered CID keeps its owner. New handshake registrations that
+claim another path's CID are dropped and counted with the `cid_collision` drop
+reason. Conflicting aliases observed on established paths are ignored; repeated
+registration by the same owner is allowed.
+
 CID changes advertised in encrypted `NEW_CONNECTION_ID` frames work through
 peer affinity while the client IP address and port remain stable. The router
 does not learn those CIDs from the encrypted frames; client migration or NAT
