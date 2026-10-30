@@ -1185,7 +1185,12 @@ impl Router {
                 self.metrics.dropped("stale_backend", 1);
                 return Ok(());
             };
-            conn.last_seen = Instant::now();
+            let now = Instant::now();
+            if conn.expired(now, self.idle_timeout) {
+                self.metrics.dropped("expired", 1);
+                return Ok(());
+            }
+            conn.last_seen = now;
             if let Some(dcid) = retry_key_dcid {
                 conn.initial_key_dcid = dcid;
             }
@@ -1333,8 +1338,13 @@ impl Router {
             let Some(conn) = self.connections.get_mut(&conn_id) else {
                 return Ok(());
             };
+            let now = Instant::now();
+            if conn.expired(now, self.idle_timeout) {
+                self.metrics.dropped("expired", 1);
+                return Ok(());
+            }
             conn.client_addr = peer;
-            conn.last_seen = Instant::now();
+            conn.last_seen = now;
             send_or_queue(&conn.backend_socket, &mut conn.backend_writer, packet, None)?;
         }
         if let Some(cid) = new_cid {
@@ -2261,6 +2271,68 @@ mod tests {
         assert_eq!(router.connections[&1].last_seen, last_seen);
         router.cleanup();
         assert!(!router.client_routes.contains_key(&peer));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expired_known_cids_drop_both_directions_without_refreshing_state() -> Result<()> {
+        for lifetime_expired in [false, true] {
+            let client = UdpSocket::bind("127.0.0.1:0").await?;
+            let peer = client.local_addr()?;
+            let (mut router, backend) = peer_fixture(peer).await?;
+            let (tx, _rx) = tokio::sync::mpsc::channel(1);
+            let conn = router.connections.get_mut(&0).unwrap();
+            if lifetime_expired {
+                conn.deadline = Some(Instant::now() - Duration::from_secs(1));
+            } else {
+                conn.last_seen = Instant::now() - Duration::from_secs(61);
+            }
+            let last_seen = conn.last_seen;
+            let initial_key_dcid = conn.initial_key_dcid.clone();
+            let cids = conn.cids.clone();
+            assert!(conn.expired(Instant::now(), router.idle_timeout));
+
+            // A known destination CID must not bypass expiry or learn its SCID.
+            let mut packet = long_packet_with_cids(b"original", b"client01");
+            packet[0] = 0xe0;
+            router.handle_datagram(peer, &packet, &tx).await?;
+            assert_backend_empty(&backend);
+            assert!(router.connections[&0].backend_writer.is_none());
+
+            // An expired backend reply must not refresh activity, learn a CID,
+            // update Retry keys, or enter the client send queue.
+            let mut sockets = ProxySockets::new("127.0.0.1:0".parse()?)?;
+            let mut retry = long_packet_with_cids(b"", b"retrycid");
+            retry[0] = 0xf0;
+            router
+                .handle_backend_datagram(
+                    &mut sockets,
+                    BackendDatagram {
+                        conn_id: 0,
+                        packet: router.packet_pool.copy_packet(&retry),
+                    },
+                )
+                .await?;
+            assert_backend_empty(&client);
+            assert!(sockets.writer.is_none());
+            let conn = &router.connections[&0];
+            assert_eq!(conn.last_seen, last_seen);
+            assert_eq!(conn.initial_key_dcid, initial_key_dcid);
+            assert_eq!(conn.cids, cids);
+            assert!(router.cid_routes.get(b"client01").is_none());
+            assert!(router.cid_routes.get(b"retrycid").is_none());
+            assert_eq!(
+                router.metrics.drops.with_label_values(&["expired"]).get(),
+                2
+            );
+
+            // In particular, idle state must remain eligible for cleanup.
+            router.cleanup();
+            assert!(router.connections.is_empty());
+            assert!(router.client_routes.is_empty());
+            assert!(router.cid_routes.get(b"original").is_none());
+            assert_eq!(router.metrics.active_paths.get(), 0);
+        }
         Ok(())
     }
 
