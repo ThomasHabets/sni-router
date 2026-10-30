@@ -59,6 +59,48 @@ const QUIC_V1_INITIAL_SALT: &[u8] = &[
 const MAX_PENDING_DATAGRAMS: usize = 32;
 const MAX_PENDING_BYTES: usize = 128 * 1024;
 
+const MAX_CRYPTO_FRAGMENTS: usize = 128;
+const MAX_SNI_METRIC_LABELS: usize = 1024;
+const MAX_SNI_METRIC_LABEL_BYTES: usize = 255;
+
+fn positive_usize(value: &str) -> std::result::Result<usize, String> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "must be a positive integer fitting usize".to_owned())
+}
+
+#[derive(Clone, Debug, clap::Args)]
+struct Limits {
+    /// Maximum retained backend paths (each currently owns a UDP socket).
+    #[arg(long, default_value_t = 1024, value_parser = positive_usize)]
+    max_paths: usize,
+
+    /// Maximum simultaneous ClientHello reassemblies.
+    #[arg(long, default_value_t = 1024, value_parser = positive_usize)]
+    max_pending_handshakes: usize,
+
+    /// Maximum total buffered Initial datagram bytes across pending handshakes.
+    #[arg(long, default_value_t = 16 * 1024 * 1024, value_parser = positive_usize)]
+    max_pending_bytes: usize,
+
+    /// Maximum retained connection IDs per backend path.
+    #[arg(long, default_value_t = 64, value_parser = positive_usize)]
+    max_cids_per_path: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_paths: 1024,
+            max_pending_handshakes: 1024,
+            max_pending_bytes: 16 * 1024 * 1024,
+            max_cids_per_path: 64,
+        }
+    }
+}
+
 /// HTTP/3 SNI router.
 #[derive(clap::Parser)]
 #[clap(version)]
@@ -90,6 +132,9 @@ struct Opt {
     /// Prometheus job name.
     #[arg(long, default_value = "sni-router-h3")]
     prometheus_job: String,
+
+    #[command(flatten)]
+    limits: Limits,
 }
 
 #[derive(Debug, Clone)]
@@ -835,12 +880,16 @@ struct CryptoReassembly {
 }
 
 impl CryptoReassembly {
-    fn insert(&mut self, offset: u64, data: &[u8]) {
+    fn insert(&mut self, offset: u64, data: &[u8]) -> Result<()> {
         if data.is_empty() {
-            return;
+            return Ok(());
         }
         let next = u64::try_from(self.bytes.len()).expect("usize fits in u64");
         if offset > next {
+            if !self.fragments.contains_key(&offset) && self.fragments.len() >= MAX_CRYPTO_FRAGMENTS
+            {
+                bail!("too many pending CRYPTO fragments");
+            }
             if self
                 .fragments
                 .get(&offset)
@@ -848,7 +897,7 @@ impl CryptoReassembly {
             {
                 self.fragments.insert(offset, data.to_vec());
             }
-            return;
+            return Ok(());
         }
         self.append(offset, data);
         while self.fragments.first_key_value().is_some_and(|(offset, _)| {
@@ -857,6 +906,7 @@ impl CryptoReassembly {
             let (offset, fragment) = self.fragments.pop_first().expect("fragment available");
             self.append(offset, &fragment);
         }
+        Ok(())
     }
 
     fn append(&mut self, offset: u64, data: &[u8]) {
@@ -952,6 +1002,9 @@ impl Connection {
 }
 
 struct Router {
+    limits: Limits,
+    pending_bytes: usize,
+    sni_metric_labels: HashSet<String>,
     metrics: metrics::Metrics,
     config: Arc<Config>,
     packet_pool: Arc<PacketPool>,
@@ -970,6 +1023,9 @@ impl Router {
     fn new(config: Arc<Config>, idle_timeout: Duration) -> Self {
         Self {
             config,
+            limits: Limits::default(),
+            pending_bytes: 0,
+            sni_metric_labels: HashSet::new(),
             metrics: metrics::Metrics::default(),
             packet_pool: Arc::new(PacketPool::default()),
             idle_timeout,
@@ -980,6 +1036,35 @@ impl Router {
             client_routes: HashMap::new(),
             pending: HashMap::new(),
         }
+    }
+
+    fn remove_pending(&mut self, key: &(SocketAddr, Vec<u8>)) -> Option<PendingConnection> {
+        let pending = self.pending.remove(key)?;
+        self.pending_bytes -= pending.buffered_bytes;
+        self.metrics.pending_bytes.set(self.pending_bytes as i64);
+        self.metrics.pending.set(self.pending.len() as i64);
+        Some(pending)
+    }
+
+    fn record_sni(&mut self, sni: Option<&str>) {
+        let label = match sni {
+            Some(name) if self.config.rules.iter().any(|rule| rule.re.is_match(name)) => {
+                if name.len() > MAX_SNI_METRIC_LABEL_BYTES
+                    || (!self.sni_metric_labels.contains(name)
+                        && self.sni_metric_labels.len() >= MAX_SNI_METRIC_LABELS)
+                {
+                    "<other>"
+                } else {
+                    if !self.sni_metric_labels.contains(name) {
+                        self.sni_metric_labels.insert(name.to_owned());
+                    }
+                    name
+                }
+            }
+            Some(_) => "<unknown>",
+            None => "<missing>",
+        };
+        self.metrics.sni.with_label_values(&[label]).inc();
     }
 
     fn set_config(&mut self, config: Arc<Config>) {
@@ -1278,47 +1363,77 @@ impl Router {
             }
         };
 
-        let pending_key = (peer, decrypted.dcid.clone());
+        let pending_key = (normalize_socket_addr(peer), decrypted.dcid.clone());
+        let buffered_count = self
+            .pending
+            .get(&pending_key)
+            .map_or(0, |pending| pending.datagrams.len());
+        if !self.pending.contains_key(&pending_key)
+            && self.pending.len() >= self.limits.max_pending_handshakes
+        {
+            self.metrics.dropped("pending_handshake_limit", 1);
+            return Ok(());
+        }
+        if self
+            .pending_bytes
+            .checked_add(packet.len())
+            .is_none_or(|bytes| bytes > self.limits.max_pending_bytes)
+        {
+            self.metrics.dropped("pending_bytes_limit", 1);
+            return Ok(());
+        }
         let now = Instant::now();
-        let clienthello = {
+        let progress: std::result::Result<Option<Option<String>>, &'static str> = (|| {
             let pending = self.pending.entry(pending_key.clone()).or_insert_with(|| {
                 self.metrics.pending.inc();
                 PendingConnection::new(peer, decrypted.dcid.clone(), now)
             });
+            // Buffer first: a rejected datagram must not grow CID/CRYPTO state.
+            pending
+                .push_datagram(packet.to_vec())
+                .map_err(|_| "pending_handshake_limit")?;
+            self.pending_bytes += packet.len();
+            self.metrics.pending_bytes.set(self.pending_bytes as i64);
             pending.last_seen = now;
             if !decrypted.scid.is_empty() {
                 pending.client_cids.insert(decrypted.scid);
             }
-            pending.push_datagram(packet.to_vec())?;
             for (offset, data) in crypto_frames {
-                pending.crypto.insert(offset, data);
+                pending
+                    .crypto
+                    .insert(offset, data)
+                    .map_err(|_| "crypto_fragment_limit")?;
             }
-            pending.crypto.clienthello()
-        }?;
-
-        let Some(clienthello) = clienthello else {
-            trace!("waiting for more QUIC Initial CRYPTO data from {peer}");
-            return Ok(());
-        };
-
-        let sni = match extract_tls_sni(clienthello) {
-            Ok(sni) => sni,
-            Err(e) => {
+            let Some(hello) = pending
+                .crypto
+                .clienthello()
+                .map_err(|_| "invalid_initial")?
+            else {
+                return Ok(None);
+            };
+            let sni = extract_tls_sni(hello).unwrap_or_else(|e| {
                 warn!("using default backend for {peer} because ClientHello SNI parse failed: {e}");
                 None
+            });
+            Ok(Some(sni))
+        })();
+        let sni = match progress {
+            Ok(Some(sni)) => sni,
+            Ok(None) => {
+                trace!("waiting for more QUIC Initial CRYPTO data from {peer}");
+                return Ok(());
+            }
+            Err(reason) => {
+                self.remove_pending(&pending_key);
+                self.metrics.dropped(reason, buffered_count + 1);
+                return Ok(());
             }
         };
-        let label = match sni.as_deref() {
-            Some(name) if self.config.rules.iter().any(|rule| rule.re.is_match(name)) => name,
-            Some(_) => "<unknown>",
-            None => "<missing>",
-        };
-        self.metrics.sni.with_label_values(&[label]).inc();
-        let route = self.route_for_sni(peer, sni)?;
-        let Some(pending) = self.pending.remove(&pending_key) else {
+        self.record_sni(sni.as_deref());
+        let Some(pending) = self.remove_pending(&pending_key) else {
             return Ok(());
         };
-        self.metrics.pending.set(self.pending.len() as i64);
+        let route = self.route_for_sni(peer, sni)?;
         self.metrics
             .routing_latency
             .observe(pending.created.elapsed().as_secs_f64() * 1000.0);
@@ -1398,6 +1513,27 @@ impl Router {
                 return Ok(());
             }
         }
+        let requested_cids: HashSet<_> = std::iter::once(&pending.initial_dcid)
+            .chain(pending.client_cids.iter())
+            .filter(|cid| !cid.is_empty())
+            .cloned()
+            .collect();
+        let retained = existing_id.map(|id| &self.connections[&id].cids);
+        let additional = requested_cids
+            .iter()
+            .filter(|cid| retained.is_none_or(|old| !old.contains(*cid)))
+            .count();
+        if retained.map_or(0, HashSet::len).saturating_add(additional)
+            > self.limits.max_cids_per_path
+        {
+            self.metrics.cid_limit.inc();
+            self.metrics.dropped("cid_limit", pending.datagrams.len());
+            return Ok(());
+        }
+        if existing_id.is_none() && self.connections.len() >= self.limits.max_paths {
+            self.metrics.dropped("path_limit", pending.datagrams.len());
+            return Ok(());
+        }
         if let Some(id) = existing_id {
             let now = Instant::now();
             let conn = self.connections.get_mut(&id).expect("indexed QUIC-LB path");
@@ -1438,15 +1574,7 @@ impl Router {
             backend_events.clone(),
             self.packet_pool.clone(),
         );
-        let mut cids = HashSet::new();
-        if !pending.initial_dcid.is_empty() {
-            cids.insert(pending.initial_dcid.clone());
-        }
-        for cid in &pending.client_cids {
-            if !cid.is_empty() {
-                cids.insert(cid.clone());
-            }
-        }
+        let cids = requested_cids;
         self.connections.insert(
             conn_id,
             Connection {
@@ -1495,6 +1623,10 @@ impl Router {
         }
         if let Some(conn) = self.connections.get_mut(&conn_id) {
             if conn.cids.contains(&cid) {
+                return;
+            }
+            if conn.cids.len() >= self.limits.max_cids_per_path {
+                self.metrics.cid_limit.inc();
                 return;
             }
             if !self.cid_routes.insert(cid.clone(), conn_id) {
@@ -1556,6 +1688,7 @@ impl Router {
             let keep = now.duration_since(pending.last_seen) < pending_timeout
                 && now.duration_since(pending.created) < pending_timeout;
             if !keep {
+                self.pending_bytes -= pending.buffered_bytes;
                 self.metrics
                     .dropped("pending_timeout", pending.datagrams.len());
                 debug!(
@@ -1567,6 +1700,7 @@ impl Router {
             keep
         });
         self.metrics.pending.set(self.pending.len() as i64);
+        self.metrics.pending_bytes.set(self.pending_bytes as i64);
     }
 }
 
@@ -1721,7 +1855,8 @@ async fn main() -> Result<()> {
     let config = load_config(&opt.config)
         .await
         .with_context(|| format!("Loading config {:?}", opt.config))?;
-    let router = Router::new(Arc::new(config), Duration::from_millis(opt.idle_timeout_ms));
+    let mut router = Router::new(Arc::new(config), Duration::from_millis(opt.idle_timeout_ms));
+    router.limits = opt.limits;
     if let Some(url) = opt.prometheus {
         metrics_push::start(router.metrics.registry.clone(), opt.prometheus_job, url)?;
     }
@@ -1733,6 +1868,372 @@ mod tests {
     use super::*;
 
     const AEAD_TAG_LEN: usize = 16;
+
+    #[test]
+    fn resource_limit_flags_require_positive_values() -> Result<()> {
+        let defaults = Opt::try_parse_from(["sni-router-h3", "-c", "h3.conf"])?;
+        assert_eq!(defaults.limits.max_paths, Limits::default().max_paths);
+        assert_eq!(
+            defaults.limits.max_pending_handshakes,
+            Limits::default().max_pending_handshakes
+        );
+        assert_eq!(
+            defaults.limits.max_pending_bytes,
+            Limits::default().max_pending_bytes
+        );
+        assert_eq!(
+            defaults.limits.max_cids_per_path,
+            Limits::default().max_cids_per_path
+        );
+        for flag in [
+            "--max-paths",
+            "--max-pending-handshakes",
+            "--max-pending-bytes",
+            "--max-cids-per-path",
+        ] {
+            let parsed = Opt::try_parse_from(["sni-router-h3", "-c", "h3.conf", flag, "1"])?;
+            assert!(
+                [
+                    parsed.limits.max_paths,
+                    parsed.limits.max_pending_handshakes,
+                    parsed.limits.max_pending_bytes,
+                    parsed.limits.max_cids_per_path
+                ]
+                .contains(&1)
+            );
+            for value in ["0", "-1", "invalid", &format!("{}0", usize::MAX)] {
+                assert!(
+                    Opt::try_parse_from(["sni-router-h3", "-c", "h3.conf", flag, value]).is_err()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_budgets_preserve_existing_state_and_release_on_completion_and_timeout()
+    -> Result<()> {
+        let config = make_config("default: < backend: < null: <> > >").await?;
+        let mut router = Router::new(Arc::new(config), Duration::from_secs(60));
+        router.limits.max_pending_handshakes = 1;
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let peer = "127.0.0.1:40001".parse()?;
+        let other = "127.0.0.1:40002".parse()?;
+        let hello = minimal_clienthello_sni("good.example");
+        let split = hello.len() / 2;
+        let first =
+            protected_initial_packet(b"initial1", b"client01", &crypto_frame(0, &hello[..split]));
+        let key = (peer, b"initial1".to_vec());
+        router.handle_datagram(peer, &first, &tx).await?;
+        let second =
+            protected_initial_packet(b"initial2", b"client02", &crypto_frame(0, &hello[..split]));
+        router.handle_datagram(other, &second, &tx).await?;
+        assert_eq!(router.pending.len(), 1);
+        assert_eq!(router.pending_bytes, first.len());
+        assert_eq!(
+            router
+                .metrics
+                .drops
+                .with_label_values(&["pending_handshake_limit"])
+                .get(),
+            1
+        );
+
+        router.limits.max_pending_handshakes = 2;
+        router.limits.max_pending_bytes = first.len();
+        router.handle_datagram(other, &second, &tx).await?;
+        let last_seen = router.pending[&key].last_seen;
+        let suffix = protected_initial_packet(
+            b"initial1",
+            b"client03",
+            &crypto_frame(split as u64, &hello[split..]),
+        );
+        router.handle_datagram(peer, &suffix, &tx).await?;
+        assert_eq!(router.pending[&key].last_seen, last_seen);
+        assert_eq!(router.pending[&key].client_cids.len(), 1);
+        assert_eq!(router.pending_bytes, first.len());
+        assert_eq!(router.metrics.pending_bytes.get(), first.len() as i64);
+        assert_eq!(
+            router
+                .metrics
+                .drops
+                .with_label_values(&["pending_bytes_limit"])
+                .get(),
+            2
+        );
+
+        router.limits.max_pending_bytes = first.len() + suffix.len();
+        router.handle_datagram(peer, &suffix, &tx).await?;
+        assert!(router.pending.is_empty());
+        assert_eq!(router.pending_bytes, 0);
+        assert_eq!(router.metrics.pending_bytes.get(), 0);
+        router.handle_datagram(other, &second, &tx).await?;
+        router.pending.values_mut().next().unwrap().created =
+            Instant::now() - Duration::from_secs(61);
+        router.cleanup();
+        assert!(router.pending.is_empty());
+        assert_eq!(router.pending_bytes, 0);
+        assert_eq!(router.metrics.pending_bytes.get(), 0);
+        router.handle_datagram(peer, &first, &tx).await?;
+        assert_eq!(router.pending.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oversized_and_invalid_pending_handshakes_release_all_state() -> Result<()> {
+        let config = make_config("default: < backend: < null: <> > >").await?;
+        let mut router = Router::new(Arc::new(config), Duration::from_secs(60));
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let peer = "127.0.0.1:40001".parse()?;
+        // Distinct SCIDs must not accumulate after the datagram limit is hit.
+        for n in 0..=MAX_PENDING_DATAGRAMS {
+            let packet = protected_initial_packet(
+                b"initial1",
+                &(n as u64).to_be_bytes(),
+                &crypto_frame(1, &[1]),
+            );
+            router.handle_datagram(peer, &packet, &tx).await?;
+            if n < MAX_PENDING_DATAGRAMS {
+                assert_eq!(
+                    router.pending.values().next().unwrap().client_cids.len(),
+                    n + 1
+                );
+            }
+        }
+        assert!(router.pending.is_empty());
+        assert_eq!(router.pending_bytes, 0);
+        // The per-handshake byte bound applies before the datagram count bound.
+        let payload = crypto_frame(1, &vec![0; 60_000]);
+        for _ in 0..3 {
+            let packet = protected_initial_packet(b"initial2", b"", &payload);
+            router.handle_datagram(peer, &packet, &tx).await?;
+        }
+        assert!(router.pending.is_empty());
+        assert_eq!(router.pending_bytes, 0);
+        let mut payload = Vec::new();
+        for n in 0..=MAX_CRYPTO_FRAGMENTS {
+            payload.extend(crypto_frame((n * 2 + 1) as u64, &[1]));
+        }
+        let packet = protected_initial_packet(b"initial3", b"client03", &payload);
+        router.handle_datagram(peer, &packet, &tx).await?;
+        assert!(router.pending.is_empty());
+        assert_eq!(router.pending_bytes, 0);
+        assert_eq!(
+            router
+                .metrics
+                .drops
+                .with_label_values(&["crypto_fragment_limit"])
+                .get(),
+            1
+        );
+        let packet =
+            protected_initial_packet(b"initial4", b"client04", &crypto_frame(0, &[2, 0, 0, 0]));
+        router.handle_datagram(peer, &packet, &tx).await?;
+        assert!(router.pending.is_empty());
+        assert_eq!(router.pending_bytes, 0);
+        assert_eq!(router.metrics.pending.get(), 0);
+        assert_eq!(router.metrics.pending_bytes.get(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn path_limit_preserves_existing_traffic_and_cleanup_releases_capacity() -> Result<()> {
+        let peer = "127.0.0.1:40001".parse()?;
+        let other = "127.0.0.1:40002".parse()?;
+        let (mut router, backend) = peer_fixture(peer).await?;
+        router.limits.max_paths = 1;
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let initial = protected_initial_packet(
+            b"another1",
+            b"client02",
+            &crypto_frame(0, &minimal_clienthello_sni("good.example")),
+        );
+        router.handle_datagram(other, &initial, &tx).await?;
+        assert_backend_empty(&backend);
+        assert_eq!(router.connections.len(), 1);
+        assert_eq!(router.next_connection_id, 1);
+        assert!(router.cid_routes.get(b"another1").is_none());
+        assert!(!router.client_routes.contains_key(&other));
+        assert_eq!(
+            router
+                .metrics
+                .drops
+                .with_label_values(&["path_limit"])
+                .get(),
+            1
+        );
+        let packet = [b"\x40".as_slice(), b"original", b"payload"].concat();
+        router.handle_datagram(peer, &packet, &tx).await?;
+        assert_eq!(receive_backend_packet(&backend).await?, packet);
+        router.connections.get_mut(&0).unwrap().deadline = Some(Instant::now());
+        router.cleanup();
+        router.handle_datagram(other, &initial, &tx).await?;
+        assert_eq!(receive_backend_packet(&backend).await?, initial);
+        assert_eq!(router.connections.len(), 1);
+        assert_eq!(router.next_connection_id, 2);
+        router.connections[&1].backend_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cid_limit_bounds_client_and_backend_aliases_without_stopping_forwarding() -> Result<()>
+    {
+        let client = UdpSocket::bind("127.0.0.1:0").await?;
+        let peer = client.local_addr()?;
+        let (mut router, backend) = peer_fixture(peer).await?;
+        router.limits.max_cids_per_path = 2;
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        for scid in [b"client01".as_slice(), b"client02", b"client01"] {
+            let packet = long_packet_with_cids(b"original", scid);
+            router.handle_datagram(peer, &packet, &tx).await?;
+            assert_eq!(receive_backend_packet(&backend).await?, packet);
+        }
+        for n in 0..128u64 {
+            let packet = long_packet_with_cids(b"original", &n.to_be_bytes());
+            router.handle_datagram(peer, &packet, &tx).await?;
+            assert_eq!(receive_backend_packet(&backend).await?, packet);
+            assert!(router.cid_routes.get(&n.to_be_bytes()).is_none());
+        }
+        let mut sockets = ProxySockets::new("127.0.0.1:0".parse()?)?;
+        let reply = long_packet_with_cids(b"", b"server01");
+        router
+            .handle_backend_datagram(
+                &mut sockets,
+                BackendDatagram {
+                    conn_id: 0,
+                    packet: router.packet_pool.copy_packet(&reply),
+                },
+            )
+            .await?;
+        assert_eq!(receive_backend_packet(&client).await?, reply);
+        assert_eq!(router.connections[&0].cids.len(), 2);
+        assert_eq!(router.cid_routes.get(b"original"), Some(&0));
+        assert_eq!(router.cid_routes.get(b"client01"), Some(&0));
+        assert!(router.cid_routes.get(b"client02").is_none());
+        assert!(router.cid_routes.get(b"server01").is_none());
+        assert_eq!(router.metrics.cid_limit.get(), 130);
+        router.connections[&0].backend_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shared_quic_lb_paths_apply_cid_limits_atomically_and_respect_path_limit() -> Result<()>
+    {
+        let backend = UdpSocket::bind("127.0.0.1:0").await?;
+        let addr = backend.local_addr()?;
+        let mut config = make_config(&format!(
+            "default: < backend: < proxy: < addr: \"{addr}\" > > >"
+        ))
+        .await?;
+        let codec = quic_lb::Codec::new(0, &[0x55; 16])?;
+        config.quic_lb.push(LbConfig {
+            codec: codec.clone(),
+            servers: HashMap::from([(123, addr)]),
+        });
+        let mut router = Router::new(Arc::new(config), Duration::from_secs(60));
+        router.limits.max_paths = 1;
+        router.limits.max_cids_per_path = 1;
+        let peer = "127.0.0.1:40001".parse()?;
+        let other = "127.0.0.1:40002".parse()?;
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let hello = crypto_frame(0, &minimal_clienthello_sni("good.example"));
+        let first = protected_initial_packet(b"initial1", b"client01", &hello);
+        router.handle_datagram(peer, &first, &tx).await?;
+        assert_backend_empty(&backend);
+        assert!(router.connections.is_empty());
+        assert_eq!(router.next_connection_id, 0);
+        router.limits.max_cids_per_path = 3;
+        router.handle_datagram(peer, &first, &tx).await?;
+        assert_eq!(receive_backend_packet(&backend).await?, first);
+        let second = protected_initial_packet(b"initial2", b"client01", &hello);
+        router.handle_datagram(peer, &second, &tx).await?;
+        assert_eq!(receive_backend_packet(&backend).await?, second);
+        assert_eq!(router.connections.len(), 1);
+        assert_eq!(router.connections[&0].cids.len(), 3);
+        let last_seen = router.connections[&0].last_seen;
+        let third = protected_initial_packet(b"initial3", b"client02", &hello);
+        router.handle_datagram(peer, &third, &tx).await?;
+        assert_backend_empty(&backend);
+        assert_eq!(router.connections[&0].last_seen, last_seen);
+        assert!(router.cid_routes.get(b"initial3").is_none());
+        assert!(router.cid_routes.get(b"client02").is_none());
+        assert_eq!(router.metrics.cid_limit.get(), 2);
+        let packet = routable_packet(&codec, 123, 1);
+        router.handle_datagram(peer, &packet, &tx).await?;
+        assert_eq!(receive_backend_packet(&backend).await?, packet);
+        router.handle_datagram(other, &packet, &tx).await?;
+        assert_backend_empty(&backend);
+        assert_eq!(router.connections.len(), 1);
+        assert_eq!(router.lb_paths.len(), 1);
+        assert_eq!(
+            router
+                .metrics
+                .drops
+                .with_label_values(&["path_limit"])
+                .get(),
+            1
+        );
+        assert_eq!(router.pending_bytes, 0);
+        router.connections[&0].backend_task.abort();
+        Ok(())
+    }
+
+    #[test]
+    fn crypto_fragment_limit_allows_retransmissions_and_contiguous_progress() -> Result<()> {
+        let mut crypto = CryptoReassembly::default();
+        for n in 0..MAX_CRYPTO_FRAGMENTS {
+            crypto.insert((n * 2 + 1) as u64, &[1])?;
+        }
+        crypto.insert(1, &[1, 1])?;
+        assert!(
+            crypto
+                .insert((MAX_CRYPTO_FRAGMENTS * 2 + 1) as u64, &[1])
+                .is_err()
+        );
+        assert_eq!(crypto.fragments.len(), MAX_CRYPTO_FRAGMENTS);
+        crypto.insert(0, &vec![1; MAX_CRYPTO_FRAGMENTS * 2])?;
+        assert!(crypto.fragments.is_empty());
+        crypto.insert(1000, &[1])?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sni_metric_labels_are_bounded_without_affecting_routing() -> Result<()> {
+        let config = make_config(
+            "rules: < regex: \".*\" backend: < null: <> > > default: < backend: < null: <> > >",
+        )
+        .await?;
+        let mut router = Router::new(Arc::new(config), Duration::from_secs(60));
+        for n in 0..MAX_SNI_METRIC_LABELS + 100 {
+            router.record_sni(Some(&format!("{n}.example")));
+        }
+        router.record_sni(Some("0.example"));
+        router.record_sni(Some(&"x".repeat(MAX_SNI_METRIC_LABEL_BYTES + 1)));
+        router.record_sni(None);
+        assert_eq!(router.sni_metric_labels.len(), MAX_SNI_METRIC_LABELS);
+        assert_eq!(
+            router.metrics.sni.with_label_values(&["<other>"]).get(),
+            101
+        );
+        assert_eq!(
+            router.metrics.sni.with_label_values(&["0.example"]).get(),
+            2
+        );
+        let families = router.metrics.registry.gather();
+        let family = families
+            .iter()
+            .find(|family| family.name() == "sni")
+            .unwrap();
+        assert_eq!(family.get_metric().len(), MAX_SNI_METRIC_LABELS + 2);
+        assert_eq!(
+            router
+                .route_for_sni("127.0.0.1:1".parse()?, Some("new.example".to_owned()))?
+                .sni
+                .as_deref(),
+            Some("new.example")
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn metrics_track_routing_traffic_drops_and_expiry() -> Result<()> {
@@ -2586,9 +3087,9 @@ default: <
         let hello = minimal_clienthello_sni("www.example.com");
         let split = hello.len() / 2;
         let mut crypto = CryptoReassembly::default();
-        crypto.insert(0, &hello[..split]);
-        crypto.insert(0, &hello[..split / 2]);
-        crypto.insert(u64::try_from(split)?, &hello[split..]);
+        crypto.insert(0, &hello[..split])?;
+        crypto.insert(0, &hello[..split / 2])?;
+        crypto.insert(u64::try_from(split)?, &hello[split..])?;
         assert_eq!(crypto.clienthello()?, Some(hello.as_slice()));
         Ok(())
     }
@@ -2603,7 +3104,7 @@ default: <
                 crypto.insert(
                     u64::try_from(cuts[part])?,
                     &hello[cuts[part]..cuts[part + 1]],
-                );
+                )?;
                 if step < 2 {
                     assert!(crypto.clienthello()?.is_none());
                 }
@@ -2617,15 +3118,15 @@ default: <
         }
 
         let mut crypto = CryptoReassembly::default();
-        crypto.insert(20, &hello[20..50]);
-        crypto.insert(20, &hello[20..25]);
-        crypto.insert(10, &hello[10..30]);
-        crypto.insert(0, &hello[..15]);
+        crypto.insert(20, &hello[20..50])?;
+        crypto.insert(20, &hello[20..25])?;
+        crypto.insert(10, &hello[10..30])?;
+        crypto.insert(0, &hello[..15])?;
         assert_eq!(crypto.bytes, hello[..50]);
-        crypto.insert(45, &hello[45..]);
-        crypto.insert(0, &hello[..10]);
+        crypto.insert(45, &hello[45..])?;
+        crypto.insert(0, &hello[..10])?;
         assert_eq!(crypto.clienthello()?, Some(hello.as_slice()));
-        crypto.insert(u64::MAX, b"sparse fragment");
+        crypto.insert(u64::MAX, b"sparse fragment")?;
         assert_eq!(crypto.bytes.len(), hello.len());
         Ok(())
     }

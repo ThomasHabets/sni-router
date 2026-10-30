@@ -7,12 +7,14 @@ pub(crate) struct Metrics {
     pub paths: IntCounter,
     pub active_paths: IntGauge,
     pub pending: IntGauge,
+    pub pending_bytes: IntGauge,
     pub sni: IntCounterVec,
     pub routing_latency: Histogram,
     pub client: Traffic,
     pub backend: Traffic,
     pub drops: IntCounterVec,
     pub errors: IntCounterVec,
+    pub cid_limit: IntCounter,
 }
 
 pub(crate) struct Traffic {
@@ -64,10 +66,14 @@ impl Default for Metrics {
                 "quic_pending_initials",
                 "ClientHello reassemblies awaiting routing"
             )),
+            pending_bytes: register!(IntGauge::new(
+                "quic_pending_initial_bytes",
+                "Buffered Initial datagram bytes across pending handshakes"
+            )),
             sni: register!(IntCounterVec::new(
                 Opts::new(
                     "sni",
-                    "Routed ClientHellos by configured SNI, <unknown>, or <missing>"
+                    "Routed ClientHellos by configured SNI, <unknown>, <missing>, or <other>"
                 ),
                 &["sni"]
             )),
@@ -96,6 +102,10 @@ impl Default for Metrics {
             errors: register!(IntCounterVec::new(
                 Opts::new("quic_errors_total", "Datagram handling and receive errors"),
                 &["source"]
+            )),
+            cid_limit: register!(IntCounter::new(
+                "quic_cid_limit_total",
+                "CID registration attempts rejected by the per-path limit"
             )),
             registry,
         }

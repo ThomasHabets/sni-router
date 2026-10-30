@@ -202,6 +202,37 @@ default: <
 ```
 
 
+### Resource limits
+
+The HTTP/3 router applies these global limits by default. All values must be
+positive integers and can be changed with command-line flags:
+
+| Flag | Default | Limits |
+| --- | --- | --- |
+| `--max-paths` | 1024 | Retained backend paths, each with a UDP socket and reader task |
+| `--max-pending-handshakes` | 1024 | Simultaneous ClientHello reassemblies |
+| `--max-pending-bytes` | 16777216 (16 MiB) | Total buffered Initial datagram bytes across pending handshakes |
+| `--max-cids-per-path` | 64 | Retained CIDs per backend path, including initial and learned IDs |
+
+When a limit is reached, the router refuses new allocations without evicting
+existing routes. A new handshake that would exceed a path's CID budget is
+rejected before forwarding, including handshakes sharing a QUIC-LB path. Later
+CID aliases beyond the budget are ignored; existing routes continue forwarding.
+Path capacity is released by periodic expiry cleanup. Pending capacity is
+released when a handshake completes, is discarded, or expires.
+
+Each pending handshake is also limited to 32 datagrams, 128 KiB of buffered
+datagrams, and 128 outstanding out-of-order CRYPTO fragments. Handshakes that
+exceed these per-handshake bounds are discarded entirely. The global byte
+budget measures datagram buffering; CRYPTO reassembly and metadata consume
+additional memory bounded by the per-handshake limits.
+
+Resource drops are counted by `quic_routing_dropped_datagrams_total` with reasons
+`path_limit`, `pending_handshake_limit`, `pending_bytes_limit`,
+`crypto_fragment_limit`, and `cid_limit`. `quic_cid_limit_total` also counts
+attempts to add CID aliases beyond the budget, even when the packet itself is
+forwarded. `quic_pending_initial_bytes` reports current datagram buffering.
+
 ### Prometheus metrics
 
 Like the TCP binary, `sni-router-h3` can push metrics to a Prometheus
@@ -222,7 +253,9 @@ as the `instance` grouping label. There is no HTTP scrape endpoint.
 | `quic_paths_total` | Backend UDP paths created, including QUIC-LB migration paths |
 | `quic_active_paths` | Retained backend UDP paths, removed on idle/lifetime cleanup |
 | `quic_pending_initials` | Initial packet reassemblies awaiting SNI routing |
-| `sni{sni="..."}` | ClientHellos reaching SNI routing; unmatched names use `<unknown>`, absent/unparseable names use `<missing>` |
+| `quic_pending_initial_bytes` | Buffered Initial datagram bytes across pending handshakes |
+| `quic_cid_limit_total` | CID registrations refused by the per-path budget |
+| `sni{sni="..."}` | ClientHellos reaching SNI routing; unmatched names use `<unknown>`, absent/unparseable names use `<missing>`, excess labels use `<other>` |
 | `quic_routing_latency_ms` | Histogram from the first buffered Initial to an SNI routing decision |
 | `quic_received_datagrams_total{source="client\|backend"}` | Received UDP datagrams |
 | `quic_received_bytes_total{source="client\|backend"}` | Received UDP payload bytes |
@@ -232,8 +265,11 @@ as the `instance` grouping label. There is no HTTP scrape endpoint.
 A path can carry multiple QUIC connections, and QUIC-LB routing can create paths
 without a ClientHello. These metrics do not measure completed TLS handshakes or
 HTTP requests. Routing drops exclude kernel/socket losses and bounded send queue
-losses. SNI labels for matching rules contain the client-supplied hostname, as in
-the TCP binary; broad regex rules can produce many distinct label values.
+losses. SNI labels for matching rules contain the client-supplied hostname, with
+at most 1024 distinct names retained for the lifetime of the process. Additional
+names and names longer than 255 bytes are counted under `<other>`, without
+changing SNI routing. The reserved `<unknown>` and `<missing>` labels remain
+available independently of that limit.
 
 ### Opt-in QUIC-LB routing and migration
 
