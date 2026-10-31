@@ -110,6 +110,9 @@ configured addresses. Existing connections retain their selected backend.
 
 ## Frontend TLS
 
+Remaining TCP correctness issues and hardening work are tracked in
+[TCP_REVIEW.md](TCP_REVIEW.md).
+
 SNI Router can terminate Frontend TLS, meaning SNI router is the only process
 that has access to the certificate keys. Backends then don't have to worry about
 TLS at all.
