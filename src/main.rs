@@ -658,22 +658,19 @@ async fn pass_fd_over_uds(
     let iov = [std::io::IoSlice::new(&bytes)];
     let cmsg = [ControlMessage::ScmRights(&[fd])];
 
-    // Async wait until it *should* be fine to write.
-    sock.writable().await.context("checking UDS for writable")?;
-
-    // Send sync, but per above *should* be fine to write. Also with
-    // `MSG_DONTWAIT` it shouldn't block.
-    //
-    // This error is sorryable, if it failed in its entirety.
-    let sent = sendmsg::<()>(
-        sock.as_raw_fd(),
-        &iov,
-        &cmsg,
-        MsgFlags::MSG_NOSIGNAL | MsgFlags::MSG_DONTWAIT,
-        None,
-    )
-    .context("sendmsg SCM_RIGHTS")?;
-
+    let sent = sock
+        .async_io(tokio::io::Interest::WRITABLE, || {
+            sendmsg::<()>(
+                sock.as_raw_fd(),
+                &iov,
+                &cmsg,
+                MsgFlags::MSG_NOSIGNAL | MsgFlags::MSG_DONTWAIT,
+                None,
+            )
+            .map_err(tokio::io::Error::from)
+        })
+        .await
+        .context("sendmsg SCM_RIGHTS")?;
     if sent != bytes.len() {
         // This is not sorryable.
         return Err(anyhow!(

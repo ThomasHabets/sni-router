@@ -41,16 +41,3 @@ Fix direction: bound accepted connection tasks with admission control, cap
 ClientHello size, total preread bytes, and record count. Include slow clients,
 fragmented records, and capacity recovery in regression tests. Apply
 these limits to both TCP accepts and received FD handoffs.
-
-## Additional best-practice work
-
-### Retry Unix socket handoff writes through Tokio's readiness API
-
-`pass_fd_over_uds` waits for writable readiness, then makes one raw nonblocking
-`sendmsg` call. A `WouldBlock` result immediately fails the handoff rather than
-clearing stale readiness and retrying.
-
-[Tokio documents that writable readiness can be a false positive](https://docs.rs/tokio/latest/tokio/net/struct.UnixDatagram.html#method.writable).
-Use `UnixDatagram::async_io` or an equivalent `try_io` retry loop around the raw
-syscall. Keep retries under the existing timeout, and never resend a successful
-FD transfer.
