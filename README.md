@@ -148,6 +148,9 @@ That lets one SNI Router use `pass: < path: "pass.sock" >` with another SNI
 Router as the backend. The receiving router uses the passed TCP fd plus the
 initial bytes from the datagram and then applies its normal SNI routing rules.
 
+Because the pre-read data is handed off with the file descriptor, a client that
+presents more than the max message size will fail to connect.
+
 ## HTTP/3 / QUIC routing
 
 The `sni-router-h3` binary listens on UDP and routes QUIC v1 / HTTP/3 traffic.
