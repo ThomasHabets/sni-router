@@ -150,15 +150,14 @@ message SNIConfig {
         // this.
         uint64 max_lifetime_ms = 3;
 
-        // Timeout for the pre-backend phase: reading enough of the TLS
-        // ClientHello to route the connection, then connecting to or handing
-        // off to the selected backend.
+        // Timeout for reading ClientHello, routing, connecting to the backend
+        // (including backend TLS), and completing frontend TLS and kTLS setup.
+        // For pass backends, also includes handing off the file descriptor.
         //
-        // This timeout stops applying once a proxy backend has been connected
-        // to, or a pass backend has received the file descriptor.
-        //
-        // This timeout therefore does NOT include any handshake with the
-        // backend, or frontend TLS. That's covered by the global and per rule
-        // max_lifetime_ms.
+        // One deadline covers all these phases. It stops applying before
+        // proxying established traffic or after the FD is handed off.
+        // TLS passed through to a backend is not completed by this router.
+        // Zero (the default) disables this timeout. Global and per-rule
+        // max_lifetime_ms limits can still end a connection earlier.
         uint64 handshake_timeout_ms = 4;
 }

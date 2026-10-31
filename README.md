@@ -129,6 +129,20 @@ configured addresses. Existing connections retain their selected backend.
 Remaining TCP correctness issues and hardening work are tracked in
 [TCP_REVIEW.md](TCP_REVIEW.md).
 
+Set the top-level `handshake_timeout_ms` to limit connection setup, including
+ClientHello routing, backend connection and backend TLS, frontend TLS completion
+and kTLS setup, and Unix socket FD handoff. For example:
+
+```protobuf
+handshake_timeout_ms: 5000
+```
+
+A single deadline covers all these phases, including sorry backends. It stops
+applying once connection setup completes; established traffic is not subject to
+this deadline. Zero or omission disables it. TLS passed through to a backend is
+not completed by the router and is outside this timeout. Global and per-rule
+`max_lifetime_ms` limits also continue to apply and can expire first.
+
 SNI Router can terminate Frontend TLS, meaning SNI router is the only process
 that has access to the certificate keys. Backends then don't have to worry about
 TLS at all.

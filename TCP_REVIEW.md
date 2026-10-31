@@ -44,18 +44,6 @@ these limits to both TCP accepts and received FD handoffs.
 
 ## Additional best-practice work
 
-### Give frontend TLS completion its own deadline
-
-For proxy backends, `handshake_timeout_ms` wraps `route_and_connect`, while
-frontend TLS runs later in `handle_connected_proxy`. A client can send its
-ClientHello, then stop before Finished; only an explicitly configured global
-or rule lifetime bounds that phase. Pass backends perform frontend TLS inside
-the handoff phase, so timeout coverage differs between backend types.
-
-Add a dedicated TLS-completion deadline while preserving the documented
-pre-backend timeout semantics. Test that stalled handshakes expire and healthy
-established connections survive beyond that deadline.
-
 ### Back off on persistent accept failures
 
 `mainloop` logs an accept error and immediately retries. Persistent errors such

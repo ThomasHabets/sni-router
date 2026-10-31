@@ -1227,12 +1227,15 @@ async fn connect_for_proxy(
     Ok(conn)
 }
 
-/// After fully connected, and handshake timeout no longer relevant, run the
-/// remaining proxying.
+/// Finish frontend TLS under the handshake deadline, then run proxying.
 ///
 /// Any failure here will NOT fall back to sorry servers, as we're already
 /// connected.
-async fn handle_connected_backend(id: usize, backend: ConnectedBackend) -> Result<()> {
+async fn handle_connected_backend(
+    id: usize,
+    backend: ConnectedBackend,
+    handshake_deadline: Option<tokio::time::Instant>,
+) -> Result<()> {
     match backend {
         // No proxying needed if fd was passed.
         ConnectedBackend::Done => Ok(()),
@@ -1243,7 +1246,18 @@ async fn handle_connected_backend(id: usize, backend: ConnectedBackend) -> Resul
             conn,
             proxy_header,
             frontend_tls,
-        } => handle_connected_proxy(id, stream, bytes, conn, proxy_header, frontend_tls).await,
+        } => {
+            handle_connected_proxy(
+                id,
+                stream,
+                bytes,
+                conn,
+                proxy_header,
+                frontend_tls,
+                handshake_deadline,
+            )
+            .await
+        }
     }
 }
 
@@ -1258,10 +1272,17 @@ async fn handle_connected_proxy(
     mut conn: tokio::net::TcpStream,
     proxy_header: bool,
     tls: Option<Arc<rustls::ServerConfig>>,
+    handshake_deadline: Option<tokio::time::Instant>,
 ) -> Result<()> {
     let (mut stream, bytes) = if let Some(tls) = tls {
         // TODO: increment handshake fail counter.
-        tls_handshake(stream, bytes, tls).await?
+        let handshake = tls_handshake(stream, bytes, tls);
+        match handshake_deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, handshake)
+                .await
+                .context("handshake timeout during frontend TLS")??,
+            None => handshake.await?,
+        }
     } else {
         (stream, bytes)
     };
@@ -1547,9 +1568,13 @@ async fn handle_conn(
     initial_bytes: Vec<u8>,
     config: &Config,
 ) -> Result<()> {
+    // Keep one deadline across routing, backend connection, and frontend TLS.
+    let handshake_deadline = config
+        .handshake_timeout
+        .map(|timeout| tokio::time::Instant::now() + timeout);
     let fut = route_and_connect(id, stream, initial_bytes, config);
-    let routed = if let Some(timeout) = config.handshake_timeout {
-        match tokio::time::timeout(timeout, fut).await {
+    let routed = if let Some(deadline) = handshake_deadline {
+        match tokio::time::timeout_at(deadline, fut).await {
             Ok(r) => r?,
             Err(e) => return Err(anyhow!("handshake timeout: {e}")),
         }
@@ -1557,7 +1582,7 @@ async fn handle_conn(
         fut.await?
     };
 
-    let fut = handle_connected_backend(id, routed.backend);
+    let fut = handle_connected_backend(id, routed.backend, handshake_deadline);
     if let Some(timeout) = routed.timeout {
         let to = tokio::time::sleep(timeout);
         tokio::select! {
@@ -2578,6 +2603,111 @@ handshake_timeout_ms: 1234
             tokio::try_join!(client, backend)
         })
         .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handshake_timeout_covers_frontend_tls_but_not_established_connection() -> Result<()> {
+        for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
+            for pass in [false, true] {
+                for stall in [false, true] {
+                    let (server_config, client_config) = test_tls_configs(version)?;
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+                    let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+                    let directory = tempfile::tempdir()?;
+                    let path = directory.path().join("handoff.sock");
+                    let receiver = UnixDatagram::bind(&path)?;
+                    let backend_text = if pass {
+                        format!("pass: < path: {:?} >", path.to_str().unwrap())
+                    } else {
+                        format!("proxy: < addr: {:?} >", backend.local_addr()?.to_string())
+                    };
+                    // No lifetime limit: the handshake timeout must close a
+                    // client stalled after ClientHello, even for proxy backends.
+                    let mut config = make_config(&format!(
+                        "handshake_timeout_ms: 600
+                         default: < backend: < {backend_text} > >"
+                    ))?;
+                    match &mut config.default.backend {
+                        Backend::Proxy { frontend_tls, .. }
+                        | Backend::Pass { frontend_tls, .. } => {
+                            *frontend_tls = Some(server_config);
+                        }
+                        Backend::Null => unreachable!(),
+                    }
+                    let mut client = tokio::net::TcpStream::connect(listener.local_addr()?).await?;
+                    let (server, _) = listener.accept().await?;
+                    let mut task =
+                        tokio::spawn(
+                            async move { handle_conn(0, server, Vec::new(), &config).await },
+                        );
+                    let result = tokio::time::timeout(MAX_TEST_CONNECTION_TIME, async {
+                        if stall {
+                            let mut tls = rustls::ClientConnection::new(
+                                client_config,
+                                "localhost".try_into()?,
+                            )?;
+                            let mut hello = Vec::new();
+                            while tls.wants_write() {
+                                tls.write_tls(&mut hello)?;
+                            }
+                            // Spend most of the budget before routing. TLS must
+                            // use the remaining budget, not start a fresh one.
+                            tokio::time::sleep(tokio::time::Duration::from_millis(400)).await;
+                            client.write_all(&hello).await?;
+                            // Never send Finished. The router must cancel the
+                            // handshake without handing off the client FD.
+                            let error = tokio::time::timeout(
+                                tokio::time::Duration::from_millis(350),
+                                &mut task,
+                            )
+                            .await??
+                            .expect_err("stalled handshake succeeded");
+                            assert!(
+                                format!("{error:#}").contains("handshake timeout"),
+                                "unexpected error: {error:#}"
+                            );
+                            if pass {
+                                let mut bytes = [0; 1];
+                                assert!(matches!(receiver.try_recv(&mut bytes),
+                                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+                            }
+                        } else {
+                            let connector = tokio_rustls::TlsConnector::from(client_config);
+                            let mut client =
+                                connector.connect("localhost".try_into()?, client).await?;
+                            let mut upstream = if pass {
+                                let (stream, initial) = recv_fd_over_uds(&receiver).await?;
+                                assert!(initial.is_empty());
+                                (&mut task).await??;
+                                stream
+                            } else {
+                                backend.accept().await?.0
+                            };
+                            // Established traffic must outlive the TLS deadline.
+                            tokio::time::sleep(tokio::time::Duration::from_millis(750)).await;
+                            client.write_all(b"ping").await?;
+                            let mut bytes = [0; 4];
+                            upstream.read_exact(&mut bytes).await?;
+                            assert_eq!(&bytes, b"ping");
+                            upstream.write_all(b"pong").await?;
+                            client.read_exact(&mut bytes).await?;
+                            assert_eq!(&bytes, b"pong");
+                            if !pass {
+                                task.abort();
+                                assert!((&mut task).await.unwrap_err().is_cancelled());
+                            }
+                        }
+                        Ok::<(), anyhow::Error>(())
+                    })
+                    .await;
+                    if result.is_err() || result.as_ref().is_ok_and(|r| r.is_err()) {
+                        task.abort();
+                    }
+                    result??;
+                }
+            }
+        }
         Ok(())
     }
 
