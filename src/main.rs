@@ -978,9 +978,12 @@ async fn tls_handshake(
         .context("creating TLS server config: This is sorry-able, but is not implemented")?;
     loop {
         // Give bytes we have to rustls.
-        {
+        if !bytes.is_empty() {
             let mut cur = std::io::Cursor::new(&bytes);
             let n = tls.read_tls(&mut cur).context("reading TLS")?;
+            if n == 0 {
+                bail!("TLS handshake stopped consuming buffered input");
+            }
             bytes.drain(0..n);
         }
         let io = tls
@@ -1091,7 +1094,13 @@ async fn tls_handshake(
             return Ok((stream, buf));
         }
 
-        // Handshake still going.
+        // rustls may consume only part of a pre-read ClientHello. Process the
+        // remaining bytes before waiting for a client that is waiting on us.
+        if !bytes.is_empty() {
+            continue;
+        }
+
+        // Handshake still going and all buffered input has been consumed.
         let mut buf = [0u8; 4096];
         let n = stream
             .read(&mut buf)
@@ -1758,6 +1767,71 @@ mod tests {
         let config_file = tmp_dir.path().join("config.cfg");
         std::fs::write(&config_file, s)?;
         load_config(config_file.to_str().unwrap(), false)
+    }
+
+    #[tokio::test]
+    async fn frontend_tls_processes_large_preread_clienthello_without_more_input() -> Result<()> {
+        #[derive(Debug)]
+        struct HelloResolver(Arc<std::sync::atomic::AtomicBool>);
+
+        impl rustls::server::ResolvesServerCert for HelloResolver {
+            fn resolve(
+                &self,
+                _: rustls::server::ClientHello<'_>,
+            ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+                self.0.store(true, Ordering::Relaxed);
+                // Stop after parsing ClientHello, before certificate and kTLS
+                // setup, so this regression needs neither keys nor kernel TLS.
+                None
+            }
+        }
+
+        for max_fragment_size in [None, Some(1024)] {
+            let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+            let resolved = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let server_config = rustls::ServerConfig::builder_with_provider(provider.clone())
+                .with_safe_default_protocol_versions()?
+                .with_no_client_auth()
+                .with_cert_resolver(Arc::new(HelloResolver(resolved.clone())));
+            let mut client_config = rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()?
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth();
+            client_config.max_fragment_size = max_fragment_size;
+            client_config.alpn_protocols = (0..40)
+                .map(|n| {
+                    let mut protocol = format!("protocol-{n}-").into_bytes();
+                    protocol.resize(200, b'x');
+                    protocol
+                })
+                .collect();
+            let mut tls =
+                rustls::ClientConnection::new(Arc::new(client_config), "localhost".try_into()?)?;
+            let mut initial = Vec::new();
+            while tls.wants_write() {
+                tls.write_tls(&mut initial)?;
+            }
+            assert!(initial.len() > 8192);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let _client = tokio::net::TcpStream::connect(listener.local_addr()?).await?;
+            let (mut server, _) = listener.accept().await?;
+            let (initial, hello) = read_tls_clienthello(&mut server, initial).await?;
+            assert_eq!(extract_sni(&hello?)?.as_deref(), Some("localhost"));
+            // Keep the client open without sending anything else. The complete
+            // ClientHello is already buffered and must reach certificate lookup.
+            let result = tokio::time::timeout(
+                MAX_TEST_CONNECTION_TIME,
+                tls_handshake(server, initial, Arc::new(server_config)),
+            )
+            .await
+            .context("frontend TLS stalled despite a complete pre-read ClientHello")?;
+            assert!(resolved.load(Ordering::Relaxed));
+            assert!(
+                result.is_err(),
+                "test resolver deliberately supplies no certificate"
+            );
+        }
+        Ok(())
     }
 
     #[test]
