@@ -44,15 +44,6 @@ these limits to both TCP accepts and received FD handoffs.
 
 ## Additional best-practice work
 
-### Back off on persistent accept failures
-
-`mainloop` logs an accept error and immediately retries. Persistent errors such
-as `EMFILE` or `ENFILE` can cause a busy loop and excessive logging.
-
-Classify persistent resource errors and retry with bounded backoff. Verify
-that accepting resumes after capacity returns. Connection admission limits
-should complement this behavior.
-
 ### Retry Unix socket handoff writes through Tokio's readiness API
 
 `pass_fd_over_uds` waits for writable readiness, then makes one raw nonblocking

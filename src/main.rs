@@ -1636,6 +1636,67 @@ impl IngressListener {
     }
 }
 
+/// Preserve the retry deadline across cancellation for configuration reloads.
+#[derive(Default)]
+struct AcceptBackoff {
+    delay: tokio::time::Duration,
+    retry_at: Option<tokio::time::Instant>,
+}
+
+impl AcceptBackoff {
+    fn failed(&mut self, error: &anyhow::Error) -> tokio::time::Duration {
+        use std::io::ErrorKind;
+        // Aborted accepts and consumed malformed handoff datagrams do not
+        // indicate resource pressure. Back off on all other errors, including
+        // EMFILE, ENFILE, ENOBUFS, ENOMEM, and unexpected persistent failures.
+        let retry_immediately = error.downcast_ref::<std::io::Error>().is_some_and(|e| {
+            matches!(
+                e.kind(),
+                ErrorKind::Interrupted
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::InvalidData
+            )
+        });
+        let delay = if retry_immediately {
+            tokio::time::Duration::ZERO
+        } else {
+            self.delay = (self.delay * 2).clamp(
+                tokio::time::Duration::from_millis(100),
+                tokio::time::Duration::from_secs(1),
+            );
+            self.delay
+        };
+        self.retry_at = Some(tokio::time::Instant::now() + delay);
+        delay
+    }
+
+    async fn accept<T, F, Fut>(&mut self, mut accept: F) -> T
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        loop {
+            if let Some(deadline) = self.retry_at {
+                tokio::time::sleep_until(deadline).await;
+            }
+            match accept().await {
+                Ok(connection) => {
+                    *self = Self::default();
+                    return connection;
+                }
+                Err(error) => {
+                    let delay = self.failed(&error);
+                    error!(
+                        "accept failed; retrying in {} ms: {error:#}",
+                        delay.as_millis()
+                    );
+                }
+            }
+        }
+    }
+}
+
 async fn mainloop(
     mut config: Arc<Config>,
     config_filename: &str,
@@ -1643,17 +1704,12 @@ async fn mainloop(
     allow_keylogging: bool,
 ) -> Result<()> {
     let mut id = 0;
+    let mut accept_backoff = AcceptBackoff::default();
     let mut hups = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
         .expect("Registering SIGHUP");
     loop {
         let conn = tokio::select! {
-            r = listener.accept() => match r {
-                Ok(r) => r,
-                Err(e) => {
-                    error!("accept failed: {e:#}");
-                    continue;
-                }
-            },
+            r = accept_backoff.accept(|| listener.accept()) => r,
             _ = hups.recv() => {
                 let cwd = std::env::current_dir().map(|c|c.display().to_string()).unwrap_or("<unknown>".to_string());
                 info!("Got SIGHUP. Loading new config {config_filename:?} in cwd {cwd:?}");
@@ -2708,6 +2764,109 @@ handshake_timeout_ms: 1234
                 }
             }
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn accept_backoff_classifies_errors_and_caps_delay() {
+        let mut backoff = AcceptBackoff::default();
+        for errno in [
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ENOBUFS,
+            libc::ENOMEM,
+            libc::EBADF,
+        ] {
+            let error =
+                anyhow::Error::from(std::io::Error::from_raw_os_error(errno)).context("accept TCP");
+            for expected in [100, 200, 400, 800, 1000, 1000] {
+                assert_eq!(
+                    backoff.failed(&error),
+                    tokio::time::Duration::from_millis(expected)
+                );
+            }
+            backoff = AcceptBackoff::default();
+        }
+        for kind in [
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::InvalidData,
+        ] {
+            let error = anyhow::Error::from(std::io::Error::from(kind)).context("accept ingress");
+            assert_eq!(backoff.failed(&error), tokio::time::Duration::ZERO);
+        }
+        assert_eq!(
+            backoff.failed(&anyhow!("unexpected accept failure")),
+            tokio::time::Duration::from_millis(100)
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_backoff_survives_cancellation_and_recovers() -> Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let mut client = tokio::net::TcpStream::connect(listener.local_addr()?).await?;
+        let mut backoff = AcceptBackoff::default();
+        let mut attempts = 0;
+        // Cancel the accept future while backing off, as SIGHUP does. The
+        // deadline and exponential delay must survive that cancellation.
+        async fn cancel_pending(future: impl std::future::Future) {
+            tokio::pin!(future);
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(future.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+        }
+        cancel_pending(backoff.accept(|| {
+            attempts += 1;
+            std::future::ready(if attempts == 1 {
+                Err(std::io::Error::from_raw_os_error(libc::EMFILE).into())
+            } else {
+                Ok(())
+            })
+        }))
+        .await;
+        assert_eq!(attempts, 1);
+        let retry_at = backoff.retry_at.unwrap();
+        cancel_pending(backoff.accept(|| {
+            attempts += 1;
+            std::future::ready(Ok(()))
+        }))
+        .await;
+        assert_eq!(
+            attempts, 1,
+            "cancellation must not bypass the retry deadline"
+        );
+        assert_eq!(backoff.retry_at, Some(retry_at));
+
+        let (mut accepted, _) = tokio::time::timeout(
+            MAX_TEST_CONNECTION_TIME,
+            backoff.accept(|| {
+                attempts += 1;
+                let fail = attempts == 2;
+                let listener = &listener;
+                async move {
+                    if fail {
+                        return Err(std::io::Error::from_raw_os_error(libc::ENFILE).into());
+                    }
+                    Ok(listener.accept().await?)
+                }
+            }),
+        )
+        .await?;
+        assert_eq!(attempts, 3);
+        assert_eq!(backoff.delay, tokio::time::Duration::ZERO);
+        assert!(backoff.retry_at.is_none());
+        client.write_all(b"ok").await?;
+        let mut bytes = [0; 2];
+        accepted.read_exact(&mut bytes).await?;
+        assert_eq!(&bytes, b"ok");
+        let error = anyhow::Error::from(std::io::Error::from_raw_os_error(libc::EMFILE));
+        assert_eq!(
+            backoff.failed(&error),
+            tokio::time::Duration::from_millis(100)
+        );
         Ok(())
     }
 
