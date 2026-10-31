@@ -26,7 +26,7 @@ connections instead of immediately discarding its wrapper. The current ktls
 wrapper alone is insufficient. Test both proxy directions and define how FD
 handoff recipients can support the required TLS control state.
 
-### High: TCP connection, preread, and metric state lacks practical bounds
+### High: TCP connection and preread state lacks practical bounds
 
 `mainloop` spawns a task for every accepted connection without an admission
 limit. Both configured timeouts are optional. `read_tls_clienthello` trusts the
@@ -37,15 +37,9 @@ Reproduction: a declared 256 KiB handshake split into one-byte TLS record
 payloads retains 1.5 MiB of wire data plus the 256 KiB handshake before SNI
 validation. The declared handshake length can be much larger.
 
-The `sni` and `frontend_handshakes` metric families also retain client-supplied
-hostname labels indefinitely. A broad matching rule permits unbounded series
-growth even after the corresponding connections close. Disabling export does
-not stop metric collection.
-
 Fix direction: bound accepted connection tasks with admission control, cap
-ClientHello size, total preread bytes, and record count, and bound hostname
-metric cardinality with an overflow bucket. Include slow clients, fragmented
-records, repeated new names, and capacity recovery in regression tests. Apply
+ClientHello size, total preread bytes, and record count. Include slow clients,
+fragmented records, and capacity recovery in regression tests. Apply
 these limits to both TCP accepts and received FD handoffs.
 
 ### Medium: backend TLS certificate and key settings are ignored

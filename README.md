@@ -92,6 +92,22 @@ default: <
 >
 ```
 
+## TCP metrics
+
+The TCP `sni-router` collects Prometheus metrics and can push them to a gateway
+with `--prometheus URL`. `--prometheus-job` defaults to `sni-router`.
+
+The `sni` counter records the literal client-provided hostname only after a
+routing rule matches and its ACL accepts; unmatched and missing names use fixed
+labels. Each observed matching hostname creates a metric series retained for
+the lifetime of the process. A regex permitting unbounded distinct matching
+SNIs therefore necessarily permits unbounded metric storage, even after those
+connections close.
+
+`frontend_handshakes` also records the actual TLS SNI on successful frontend
+handshakes, including default frontend-TLS routes. Disabling metric export does
+not stop collection or retention.
+
 ## DNS resolution
 
 The default `hickory-resolver` Cargo feature uses a shared asynchronous DNS
