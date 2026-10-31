@@ -70,10 +70,14 @@ message Backend {
                 string mtls_ca = 3;
         }
         message BackendTls {
+                // Optional PEM client certificate chain, leaf first.
+                // Set together with key_file to authenticate to the backend.
                 string cert_file = 1;
+                // PEM private key matching the client certificate.
                 string key_file = 2;
 
-                // Yolo. Don't care about name matching or expiry.
+                // Skip backend certificate verification, including name and
+                // expiry checks. Configured client credentials still apply.
                 bool insecure = 3;
 
                 // If set, the server must be from this CA.

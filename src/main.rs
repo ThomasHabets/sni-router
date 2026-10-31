@@ -275,19 +275,26 @@ fn load_backend_tls(
     pb: &protos::backend::BackendTls,
     allow_keylogging: bool,
 ) -> Result<Arc<rustls::ClientConfig>> {
-    let mut cfg = if pb.insecure {
+    if pb.cert_file.is_empty() != pb.key_file.is_empty() {
+        bail!("backend TLS client authentication requires both cert_file and key_file");
+    }
+    let builder = if pb.insecure {
         rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(YoloVerifier {}))
-            .with_no_client_auth()
     } else {
         let mut roots = rustls::RootCertStore::empty();
         let certs = rustls_native_certs::load_native_certs();
         roots.add_parsable_certificates(certs.certs);
 
-        rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth()
+        rustls::ClientConfig::builder().with_root_certificates(roots)
+    };
+    let mut cfg = if pb.cert_file.is_empty() {
+        builder.with_no_client_auth()
+    } else {
+        builder
+            .with_client_auth_cert(load_certs(&pb.cert_file)?, load_private_key(&pb.key_file)?)
+            .context("loading backend TLS client credentials")?
     };
     cfg.enable_secret_extraction = true;
     if allow_keylogging {
@@ -1784,6 +1791,194 @@ mod tests {
         let config_file = tmp_dir.path().join("config.cfg");
         std::fs::write(&config_file, s)?;
         load_config(config_file.to_str().unwrap(), false)
+    }
+
+    fn test_backend_tls_options(insecure: bool) -> protos::backend::BackendTls {
+        protos::backend::BackendTls {
+            cert_file: concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/localhost-cert.pem"
+            )
+            .to_owned(),
+            key_file: concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/localhost-key.pem"
+            )
+            .to_owned(),
+            insecure,
+        }
+    }
+
+    #[test]
+    fn backend_tls_validates_client_credentials_during_config_load() -> Result<()> {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let directory = tempfile::tempdir()?;
+        let empty = directory.path().join("empty.pem");
+        let malformed = directory.path().join("malformed.pem");
+        std::fs::write(&empty, "")?;
+        std::fs::write(
+            &malformed,
+            "-----BEGIN CERTIFICATE-----\nnot a certificate\n-----END CERTIFICATE-----\n",
+        )?;
+        for insecure in [false, true] {
+            let options = test_backend_tls_options(insecure);
+            assert!(
+                load_backend_tls(&options, false)?
+                    .client_auth_cert_resolver
+                    .has_certs()
+            );
+            let anonymous = protos::backend::BackendTls {
+                insecure,
+                ..Default::default()
+            };
+            assert!(
+                !load_backend_tls(&anonymous, false)?
+                    .client_auth_cert_resolver
+                    .has_certs()
+            );
+            let mut invalid = Vec::new();
+            for (cert, key) in [
+                ("".to_owned(), options.key_file.clone()),
+                (options.cert_file.clone(), "".to_owned()),
+                (
+                    directory
+                        .path()
+                        .join("missing-cert.pem")
+                        .display()
+                        .to_string(),
+                    options.key_file.clone(),
+                ),
+                (
+                    options.cert_file.clone(),
+                    directory
+                        .path()
+                        .join("missing-key.pem")
+                        .display()
+                        .to_string(),
+                ),
+                (empty.display().to_string(), options.key_file.clone()),
+                (malformed.display().to_string(), options.key_file.clone()),
+                (options.cert_file.clone(), empty.display().to_string()),
+                (options.cert_file.clone(), malformed.display().to_string()),
+                (
+                    options.cert_file.clone(),
+                    concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/tests/fixtures/mismatched-key.pem"
+                    )
+                    .to_owned(),
+                ),
+            ] {
+                invalid.push(protos::backend::BackendTls {
+                    cert_file: cert,
+                    key_file: key,
+                    insecure,
+                });
+            }
+            for invalid in invalid {
+                let text = format!(
+                    "default: < backend: < proxy: < addr: \"localhost:443\" backend_tls: < cert_file: {:?} key_file: {:?} insecure: {} > > > >",
+                    invalid.cert_file, invalid.key_file, invalid.insecure
+                );
+                assert!(
+                    make_config(&text).is_err(),
+                    "invalid backend TLS credentials accepted"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn proxy_backend_tls_authenticates_with_configured_client_certificate() -> Result<()> {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        for insecure in [false, true] {
+            for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
+                let options = test_backend_tls_options(insecure);
+                let certs = load_certs(&options.cert_file)?;
+                let mut roots = rustls::RootCertStore::empty();
+                for cert in &certs {
+                    roots.add(cert.clone())?;
+                }
+                let roots = Arc::new(roots);
+                let verifier =
+                    rustls::server::WebPkiClientVerifier::builder(roots.clone()).build()?;
+                let mut server_config =
+                    rustls::ServerConfig::builder_with_protocol_versions(&[version])
+                        .with_client_cert_verifier(verifier)
+                        .with_single_cert(certs.clone(), load_private_key(&options.key_file)?)?;
+                server_config.send_tls13_tickets = 0;
+                let server_config = Arc::new(server_config);
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+                let addr = format!("localhost:{}", listener.local_addr()?.port());
+                let mut config = Arc::try_unwrap(load_backend_tls(&options, false)?).unwrap();
+                if !insecure {
+                    // Trust the local test identity while retaining full
+                    // certificate and hostname verification on the backend.
+                    config.dangerous().set_certificate_verifier(
+                        rustls::client::WebPkiServerVerifier::builder(roots).build()?,
+                    );
+                }
+                let client_config = Arc::new(config);
+                let server = async {
+                    let (stream, _) = listener.accept().await?;
+                    let mut tls = tokio_rustls::TlsAcceptor::from(server_config.clone())
+                        .accept(stream)
+                        .await?;
+                    assert_eq!(tls.get_ref().1.peer_certificates().unwrap(), certs);
+                    let mut request = [0; 4];
+                    tls.read_exact(&mut request).await?;
+                    assert_eq!(&request, b"ping");
+                    tls.write_all(b"pong").await?;
+                    tls.flush().await?;
+                    Ok::<_, anyhow::Error>(())
+                };
+                let client = async {
+                    let mut stream = connect_for_proxy(0, &addr, Some(client_config)).await?;
+                    stream.write_all(b"ping").await?;
+                    let mut response = [0; 4];
+                    stream.read_exact(&mut response).await?;
+                    assert_eq!(&response, b"pong");
+                    Ok::<_, anyhow::Error>(())
+                };
+                tokio::time::timeout(MAX_TEST_CONNECTION_TIME, async {
+                    tokio::try_join!(server, client)
+                })
+                .await??;
+
+                // The same backend refuses clients that omit their certificate.
+                let anonymous = load_backend_tls(
+                    &protos::backend::BackendTls {
+                        insecure: true,
+                        ..Default::default()
+                    },
+                    false,
+                )?;
+                let server = async {
+                    let (stream, _) = listener.accept().await?;
+                    Ok::<_, anyhow::Error>(
+                        tokio_rustls::TlsAcceptor::from(server_config)
+                            .accept(stream)
+                            .await
+                            .is_err(),
+                    )
+                };
+                let client = async {
+                    let stream = tokio::net::TcpStream::connect(listener.local_addr()?).await?;
+                    Ok::<_, anyhow::Error>(
+                        tokio_rustls::TlsConnector::from(anonymous)
+                            .connect("localhost".try_into()?, stream)
+                            .await,
+                    )
+                };
+                let (rejected, _client) = tokio::time::timeout(MAX_TEST_CONNECTION_TIME, async {
+                    tokio::try_join!(server, client)
+                })
+                .await??;
+                assert!(rejected);
+            }
+        }
+        Ok(())
     }
 
     fn test_tls_configs(

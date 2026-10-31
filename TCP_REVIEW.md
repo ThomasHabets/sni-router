@@ -42,19 +42,6 @@ ClientHello size, total preread bytes, and record count. Include slow clients,
 fragmented records, and capacity recovery in regression tests. Apply
 these limits to both TCP accepts and received FD handoffs.
 
-### Medium: backend TLS certificate and key settings are ignored
-
-`load_backend_tls` does not load the `cert_file` and `key_file` fields defined
-by `BackendTls` in [proto/sni_router.proto](proto/sni_router.proto). Both the
-verified and insecure branches use `with_no_client_auth()`.
-
-Reproduction: configuring nonexistent client certificate and key paths still
-succeeds, and the resulting configuration has no client certificate.
-
-Fix direction: implement backend client-certificate authentication or reject
-these fields explicitly. Validate paired credentials at configuration load and
-reload. Test successful backend mTLS, invalid credentials, and missing files.
-
 ## Additional best-practice work
 
 ### Give frontend TLS completion its own deadline

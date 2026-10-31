@@ -146,6 +146,34 @@ fail with `EKEYEXPIRED`. Since the handed-to process doesn't have access to the
 previous key material, it is unable to handle a key update. See [kernel
 docs](https://kernel.org/doc/html/latest/networking/tls.html).
 
+## Backend TLS and mTLS
+
+`proxy.backend_tls` enables TLS to the backend. To authenticate with a client
+certificate, configure a PEM certificate chain (leaf first) and its matching
+PEM private key:
+
+```text
+backend: <
+        proxy: <
+                addr: "backend.example.com:443"
+                backend_tls: <
+                        cert_file: "/etc/sni-router/client-chain.pem"
+                        key_file: "/etc/sni-router/client-key.pem"
+                >
+        >
+>
+```
+
+Both fields must be supplied together. Omitting both preserves TLS without
+client authentication. Missing, empty, malformed, or mismatched credentials
+fail configuration loading; an invalid SIGHUP reload keeps the previous
+configuration active. Paths are relative to the process working directory and
+must be readable under `--restrict-dirs`.
+
+Backend certificates are verified against the system trust store by default.
+`insecure: true` disables backend certificate verification but still supplies
+configured client credentials when the backend requests them.
+
 ## Unix domain socket handoff
 
 On unix systems you can hand off a file descriptor from one process to another,
