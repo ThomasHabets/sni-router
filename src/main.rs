@@ -956,6 +956,60 @@ enum ConnectedBackend {
     },
 }
 
+/// Length of one TLS record, including its five-byte header.
+fn tls_record_len(bytes: &[u8]) -> Result<usize> {
+    let header = bytes
+        .get(..5)
+        .context("incomplete pre-read TLS record header")?;
+    Ok(5 + usize::from(u16::from_be_bytes([header[3], header[4]])))
+}
+
+/// Feed exactly one complete record to rustls, preserving its record boundary.
+fn process_tls_record(
+    tls: &mut rustls::ServerConnection,
+    record: &[u8],
+    plaintext: &mut Vec<u8>,
+) -> Result<()> {
+    use std::io::Read;
+
+    let mut cursor = std::io::Cursor::new(record);
+    while cursor.position() < record.len() as u64 {
+        if tls.read_tls(&mut cursor).context("reading TLS")? == 0 {
+            bail!("TLS handshake stopped consuming buffered input");
+        }
+        let io = tls
+            .process_new_packets()
+            .context("processing TLS packets")?;
+        let count = io.plaintext_bytes_to_read();
+        if count > 0 {
+            let start = plaintext.len();
+            plaintext.resize(start + count, 0);
+            tls.reader()
+                .read_exact(&mut plaintext[start..])
+                .context("draining buffered TLS plaintext")?;
+        }
+    }
+    Ok(())
+}
+
+/// Process only complete records already held in userspace. Never read the
+/// socket after the handshake: later ciphertext belongs to the kernel.
+fn process_buffered_tls_records(
+    tls: &mut rustls::ServerConnection,
+    mut bytes: &[u8],
+    plaintext: &mut Vec<u8>,
+) -> Result<()> {
+    while !bytes.is_empty() {
+        let len = tls_record_len(bytes)?;
+        let record = bytes
+            .get(..len)
+            .context("incomplete pre-read TLS record payload")?;
+        process_tls_record(tls, record, plaintext)?;
+        bytes = &bytes[len..];
+    }
+    Ok(())
+}
+
 /// Perform TLS handshake and setsockopt with kTLS.
 ///
 /// Returns the new stream and the new initial bytes.
@@ -964,7 +1018,6 @@ async fn tls_handshake(
     mut bytes: Vec<u8>,
     cfg: Arc<rustls::ServerConfig>,
 ) -> Result<(tokio::net::TcpStream, Vec<u8>)> {
-    use std::io::Read;
     use tokio::io::AsyncWriteExt;
 
     debug!("Handshaking…");
@@ -976,30 +1029,28 @@ async fn tls_handshake(
     // Anything after creating the config is unsafe to go to sorry-server.
     let mut tls = rustls::ServerConnection::new(cfg)
         .context("creating TLS server config: This is sorry-able, but is not implemented")?;
+    let mut plaintext = Vec::new();
     loop {
-        // Give bytes we have to rustls.
-        if !bytes.is_empty() {
-            let mut cur = std::io::Cursor::new(&bytes);
-            let n = tls.read_tls(&mut cur).context("reading TLS")?;
-            if n == 0 {
-                bail!("TLS handshake stopped consuming buffered input");
-            }
-            bytes.drain(0..n);
+        // Read no further than the next record. In particular, receiving
+        // Finished must not pull a prefix of application data out of the socket.
+        ensure_bytes_available(&mut stream, &mut bytes, 5)
+            .await
+            .context("reading TLS handshake record header")?;
+        let len = tls_record_len(&bytes)?;
+        ensure_bytes_available(&mut stream, &mut bytes, len)
+            .await
+            .context("reading TLS handshake record payload")?;
+        process_tls_record(&mut tls, &bytes[..len], &mut plaintext)?;
+        bytes.drain(..len);
+        if !tls.is_handshaking() {
+            process_buffered_tls_records(&mut tls, &bytes, &mut plaintext)?;
         }
-        let io = tls
-            .process_new_packets()
-            .context("processing TLS packets")?;
 
-        // Send rustls bytes to the peer.
-        let bytes_to_write = io.tls_bytes_to_write();
-        if bytes_to_write > 0 {
-            let mut buf = vec![0u8; bytes_to_write];
-            let mut cur = std::io::Cursor::new(&mut buf);
-            let n = tls.write_tls(&mut cur).context("writing TLS")?;
-            // TODO: can we assume remote side will not be overwhelmed?
-            // If it is, and insists on writing, then we deadlock (time out).
+        while tls.wants_write() {
+            let mut output = Vec::new();
+            tls.write_tls(&mut output).context("writing TLS")?;
             stream
-                .write_all(&buf[..n])
+                .write_all(&output)
                 .await
                 .context("writing as part of handshake")?;
         }
@@ -1043,14 +1094,6 @@ async fn tls_handshake(
                     "Handshake done using version {hs_version}, handshake kind {hs_kind}, cipher {hs_cipher}, kx {hs_key_exchange_full}"
                 );
             }
-            let plain_n = io.plaintext_bytes_to_read();
-            let mut buf = vec![0u8; plain_n];
-            let n = tls
-                .reader()
-                .read(&mut buf[..plain_n])
-                .context("reading when handshake done")?;
-            assert_eq!(plain_n, n);
-
             // Enable initial TLS option.
             let ulp_name = b"tls\0";
             let rc = unsafe {
@@ -1091,33 +1134,7 @@ async fn tls_handshake(
                     return Err(anyhow!("setsockopt(SOL_TLS)=>{rc}: {err}"));
                 }
             }
-            return Ok((stream, buf));
-        }
-
-        // rustls may consume only part of a pre-read ClientHello. Process the
-        // remaining bytes before waiting for a client that is waiting on us.
-        if !bytes.is_empty() {
-            continue;
-        }
-
-        // Handshake still going and all buffered input has been consumed.
-        let mut buf = [0u8; 4096];
-        let n = stream
-            .read(&mut buf)
-            .await
-            .context("reading during handshake")?;
-        if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "EOF during handshake",
-            )
-            .into());
-        }
-        bytes.extend(&buf[..n]);
-
-        // TODO: what should this magic value be?
-        if bytes.len() > 8192 {
-            return Err(anyhow!("max TLS outstanding size exceeded"));
+            return Ok((stream, plaintext));
         }
     }
 }
@@ -1767,6 +1784,194 @@ mod tests {
         let config_file = tmp_dir.path().join("config.cfg");
         std::fs::write(&config_file, s)?;
         load_config(config_file.to_str().unwrap(), false)
+    }
+
+    fn test_tls_configs(
+        version: &'static rustls::SupportedProtocolVersion,
+    ) -> Result<(Arc<rustls::ServerConfig>, Arc<rustls::ClientConfig>)> {
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let certs =
+            CertificateDer::pem_slice_iter(include_bytes!("../tests/fixtures/localhost-cert.pem"))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+        let key =
+            PrivateKeyDer::from_pem_slice(include_bytes!("../tests/fixtures/localhost-key.pem"))?;
+        let mut server = rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[version])?
+            .with_no_client_auth()
+            .with_single_cert(certs.clone(), key)?;
+        server.enable_secret_extraction = true;
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in certs {
+            roots.add(cert)?;
+        }
+        let client = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[version])?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        Ok((Arc::new(server), Arc::new(client)))
+    }
+
+    async fn read_server_handshake(
+        tls: &mut rustls::ClientConnection,
+        stream: &mut tokio::net::TcpStream,
+    ) -> Result<()> {
+        let mut input = [0; 4096];
+        while tls.is_handshaking() {
+            let n = stream.read(&mut input).await?;
+            if n == 0 {
+                bail!("EOF during test client handshake");
+            }
+            let mut cursor = std::io::Cursor::new(&input[..n]);
+            while cursor.position() < n as u64 {
+                tls.read_tls(&mut cursor)?;
+                tls.process_new_packets()?;
+            }
+            if tls.is_handshaking() && tls.wants_write() {
+                let mut output = Vec::new();
+                while tls.wants_write() {
+                    tls.write_tls(&mut output)?;
+                }
+                stream.write_all(&output).await?;
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn frontend_tls_leaves_application_ciphertext_on_socket_for_fd_handoff() -> Result<()> {
+        for (version, payload_len) in [
+            (&rustls::version::TLS13, 0),
+            (&rustls::version::TLS13, UDS_DGRAM_BUF_CAPACITY * 4),
+            (&rustls::version::TLS12, 0),
+            (&rustls::version::TLS12, UDS_DGRAM_BUF_CAPACITY * 4),
+        ] {
+            let (server_config, client_config) = test_tls_configs(version)?;
+            let mut tls = rustls::ClientConnection::new(client_config, "localhost".try_into()?)?;
+            let mut hello = Vec::new();
+            while tls.wants_write() {
+                tls.write_tls(&mut hello)?;
+            }
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let mut client = tokio::net::TcpStream::connect(listener.local_addr()?).await?;
+            let (server, _) = listener.accept().await?;
+            let directory = tempfile::tempdir()?;
+            let path = directory.path().join("handoff.sock");
+            let receiver = UnixDatagram::bind(&path)?;
+            let sender = UnixDatagram::unbound()?;
+            sender.connect(&path)?;
+            let task = tokio::spawn(async move {
+                let (stream, plaintext) = tls_handshake(server, hello, server_config).await?;
+                assert!(
+                    plaintext.is_empty(),
+                    "application data must stay on the socket"
+                );
+                pass_fd_over_uds(stream, sender, plaintext).await
+            });
+            let result = tokio::time::timeout(MAX_TEST_CONNECTION_TIME, async {
+                read_server_handshake(&mut tls, &mut client).await?;
+                // Queue Finished and far more application data than fits in the
+                // handoff datagram. Only Finished should be read by userspace.
+                let payload = vec![42; payload_len];
+                let send = async {
+                    let mut offset = 0;
+                    while offset < payload.len() {
+                        let n = std::io::Write::write(&mut tls.writer(), &payload[offset..])?;
+                        offset += n;
+                        let mut output = Vec::new();
+                        while tls.wants_write() {
+                            tls.write_tls(&mut output)?;
+                        }
+                        client.write_all(&output).await?;
+                    }
+                    let mut output = Vec::new();
+                    while tls.wants_write() {
+                        tls.write_tls(&mut output)?;
+                    }
+                    client.write_all(&output).await?;
+                    Ok::<_, anyhow::Error>(())
+                };
+                let receive = async {
+                    let (mut handed_stream, initial) = recv_fd_over_uds(&receiver).await?;
+                    assert!(initial.is_empty());
+                    let mut received = vec![0; payload.len()];
+                    handed_stream.read_exact(&mut received).await?;
+                    assert_eq!(received, payload);
+                    Ok::<_, anyhow::Error>(())
+                };
+                tokio::try_join!(send, receive)?;
+                Ok::<_, anyhow::Error>(())
+            })
+            .await;
+            if result.is_err() || result.as_ref().is_ok_and(|result| result.is_err()) {
+                task.abort();
+            }
+            result??;
+            task.await??;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn buffered_tls_records_preserve_all_plaintext_and_reject_partial_input() -> Result<()> {
+        for version in [&rustls::version::TLS13, &rustls::version::TLS12] {
+            let (server_config, client_config) = test_tls_configs(version)?;
+            let mut server = rustls::ServerConnection::new(server_config)?;
+            let mut client = rustls::ClientConnection::new(client_config, "localhost".try_into()?)?;
+            let mut plaintext = Vec::new();
+            while server.is_handshaking()
+                || client.is_handshaking()
+                || client.wants_write()
+                || server.wants_write()
+            {
+                let mut flight = Vec::new();
+                while client.wants_write() {
+                    client.write_tls(&mut flight)?;
+                }
+                process_buffered_tls_records(&mut server, &flight, &mut plaintext)?;
+                assert!(plaintext.is_empty());
+                flight.clear();
+                while server.wants_write() {
+                    server.write_tls(&mut flight)?;
+                }
+                let mut cursor = std::io::Cursor::new(&flight);
+                while cursor.position() < flight.len() as u64 {
+                    client.read_tls(&mut cursor)?;
+                    client.process_new_packets()?;
+                }
+            }
+            let mut ciphertext = Vec::new();
+            let mut expected = b"already drained:".to_vec();
+            for payload in [b"first".to_vec(), vec![42; 32_000], b"last".to_vec()] {
+                std::io::Write::write_all(&mut client.writer(), &payload)?;
+                while client.wants_write() {
+                    client.write_tls(&mut ciphertext)?;
+                }
+                expected.extend(payload);
+            }
+            plaintext.extend(b"already drained:");
+            // Neither a partial header nor a partial record may be silently
+            // discarded at handoff. This helper has no socket to read ahead.
+            assert!(
+                process_buffered_tls_records(&mut server, &ciphertext[..4], &mut plaintext)
+                    .is_err()
+            );
+            let first_record_len = tls_record_len(&ciphertext)?;
+            assert!(
+                process_buffered_tls_records(
+                    &mut server,
+                    &ciphertext[..first_record_len - 1],
+                    &mut plaintext
+                )
+                .is_err()
+            );
+            assert_eq!(plaintext, b"already drained:");
+            process_buffered_tls_records(&mut server, &ciphertext, &mut plaintext)?;
+            assert_eq!(plaintext, expected);
+            assert!(!server.is_handshaking());
+            // Secret extraction must reflect all records decrypted in userspace.
+            assert!(server.dangerous_extract_secrets()?.rx.0 > 1);
+        }
+        Ok(())
     }
 
     #[tokio::test]

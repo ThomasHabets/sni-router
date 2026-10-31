@@ -6,25 +6,6 @@ handoff.
 
 ## Confirmed issues
 
-### High: buffered ciphertext can be lost during frontend kTLS handoff
-
-`tls_handshake` switches to kTLS after rustls completes the handshake. It drains
-available plaintext, but does not finish processing a partial encrypted record
-already buffered inside rustls. Installing keys on the underlying TCP socket
-does not restore ciphertext that userspace has already read from that socket.
-
-Reproduction: send TLS Finished and a 16,000-byte application record together.
-The handshake completes with no buffered plaintext, then the first application
-read fails with `EMSGSIZE`. The error can depend on the ciphertext
-bytes left at the kernel's next read boundary.
-
-Fix direction: drain complete plaintext and finish any partially buffered TLS
-record before transferring record processing to the kernel. Preserve record
-sequence numbers and any application bytes drained during this transition.
-The [ktls CorkStream documentation](https://docs.rs/ktls/6.0.2/ktls/struct.CorkStream.html)
-describes this boundary problem. Add regressions covering coalesced Finished
-and application data, partial records, and several complete application records.
-
 ### High: post-handshake TLS control messages are not handled
 
 Frontend TLS returns a raw `TcpStream` after installing kTLS keys. Backend TLS

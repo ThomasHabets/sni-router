@@ -154,6 +154,11 @@ initial bytes from the datagram and then applies its normal SNI routing rules.
 Because the pre-read data is handed off with the file descriptor, a client that
 presents more than the max message size will fail to connect.
 
+Frontend TLS handshake reads stop at record boundaries. After the handshake,
+only complete TLS records already buffered in userspace are processed into
+plaintext for handoff. Later application ciphertext stays on the socket for
+kTLS, so queued application data does not enlarge the handoff datagram.
+
 ## HTTP/3 / QUIC routing
 
 The `sni-router-h3` binary listens on UDP and routes QUIC v1 / HTTP/3 traffic.
