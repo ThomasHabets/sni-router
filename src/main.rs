@@ -1492,6 +1492,7 @@ async fn route_and_connect(
             debug!("id={id} ClientHello len={} bytes", clienthello.len());
             match extract_sni(&clienthello)? {
                 Some(sni) => {
+                    tracing::Span::current().record("sni", sni.as_str());
                     debug!("id={id} SNI: {sni:?}");
                     for rule in &config.rules {
                         if !rule.re.is_match(&sni) {
@@ -1728,7 +1729,7 @@ async fn mainloop(
         debug!("id={id} fd={} Accepted {}", stream.as_raw_fd(), peer);
         let config = config.clone();
         tokio::spawn(async move {
-            let peer_span = tracing::error_span!("peer", "{peer}");
+            let peer_span = tracing::error_span!("peer", sni = tracing::field::Empty, "{peer}");
             // TODO: why is only the first span span actually used?
             // let id_span = tracing::info_span!("id", "{id}");
             async move {
@@ -2656,6 +2657,94 @@ handshake_timeout_ms: 1234
             tokio::try_join!(client, backend)
         })
         .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn frontend_mtls_failure_logs_sni_for_matched_and_default_routes() -> Result<()> {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        // Keep two dispatchers registered: tracing's single-dispatcher
+        // optimization otherwise caches callsites as disabled when another
+        // test first reaches them without a thread-local subscriber.
+        let _baseline = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        for matched in [false, true] {
+            let directory = tempfile::tempdir()?;
+            let log_path = directory.path().join("router.log");
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .without_time()
+                .with_writer(std::sync::Mutex::new(std::fs::File::create(&log_path)?))
+                .finish();
+            // Tokio's default test runtime keeps all these tasks on this thread.
+            let _subscriber = tracing::subscriber::set_default(subscriber);
+            let options = test_backend_tls_options(false);
+            let certs = load_certs(&options.cert_file)?;
+            let mut roots = rustls::RootCertStore::empty();
+            for cert in &certs {
+                roots.add(cert.clone())?;
+            }
+            let verifier =
+                rustls::server::WebPkiClientVerifier::builder(Arc::new(roots)).build()?;
+            let server_config = rustls::ServerConfig::builder()
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(certs, load_private_key(&options.key_file)?)?;
+            let (_, client_config) = test_tls_configs(&rustls::version::TLS13)?;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let addr = listener.local_addr()?;
+            let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let rule = format!(
+                "backend: < proxy: < addr: {:?} > >",
+                backend.local_addr()?.to_string()
+            );
+            let mut config = make_config(&if matched {
+                format!("rules: < regex: \"localhost\" {rule} > default: < backend: < null: <> > >")
+            } else {
+                format!("default: < {rule} >")
+            })?;
+            let selected = if matched {
+                &mut config.rules[0]
+            } else {
+                &mut config.default
+            };
+            match &mut selected.backend {
+                Backend::Proxy { frontend_tls, .. } => {
+                    *frontend_tls = Some(Arc::new(server_config))
+                }
+                _ => unreachable!(),
+            }
+            let router = tokio::spawn(async move {
+                mainloop(Arc::new(config), "", IngressListener::Tcp(listener), false).await
+            });
+            let result = tokio::time::timeout(MAX_TEST_CONNECTION_TIME, async {
+                let stream = tokio::net::TcpStream::connect(addr).await?;
+                let connector = tokio_rustls::TlsConnector::from(client_config);
+                // TLS 1.3 clients can finish locally before the server rejects
+                // their missing certificate, so also wait for the socket to close.
+                if let Ok(mut client) = connector.connect("localhost".try_into()?, stream).await {
+                    let mut byte = [0];
+                    assert!(!matches!(client.read(&mut byte).await, Ok(n) if n > 0));
+                }
+                loop {
+                    let log = std::fs::read_to_string(&log_path)?;
+                    if let Some(line) = log
+                        .lines()
+                        .find(|line| line.contains("peer sent no certificates"))
+                    {
+                        assert!(
+                            line.contains("sni=\"localhost\""),
+                            "SNI missing from error (matched={matched}): {log}"
+                        );
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                Ok::<(), anyhow::Error>(())
+            })
+            .await;
+            router.abort();
+            let _ = router.await;
+            result??;
+        }
         Ok(())
     }
 
